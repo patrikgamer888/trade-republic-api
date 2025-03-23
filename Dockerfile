@@ -7,13 +7,10 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci
+RUN npm install
 
 # Copy application code
 COPY . .
-
-# Set environment variables if needed (can also be set in Render dashboard)
-# ENV NODE_ENV=production
 
 # Command to run the app
 CMD ["node", "server.js"]
