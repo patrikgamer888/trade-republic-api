@@ -1,0 +1,18 @@
+{
+  "name": "trade-republic-portfolio-tracker",
+  "version": "1.0.0",
+  "description": "Automated Trade Republic portfolio tracking on Render",
+  "main": "render.js",
+  "scripts": {
+    "start": "node render.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "puppeteer": "^22.1.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "node-fetch": "^3.3.2"
+  }
+}
