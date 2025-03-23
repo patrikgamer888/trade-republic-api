@@ -1,1 +1,0 @@
-# trade-republic-api
