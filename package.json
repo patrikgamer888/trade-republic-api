@@ -1,14 +1,13 @@
 {
   "name": "trade-republic-api",
-  "version": "1.0.0",
-  "description": "API service for Trade Republic portfolio data",
+  "version": "1.1.0",
+  "description": "API service for Trade Republic portfolio data with session management",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=16.0.0"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -16,9 +15,8 @@
     "puppeteer": "^22.1.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "express-rate-limit": "^7.1.5"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.3"
+    "express-rate-limit": "^7.1.5",
+    "uuid": "^9.0.1",
+    "rimraf": "^5.0.5"
   }
 }
