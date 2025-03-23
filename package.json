@@ -1,18 +1,24 @@
 {
-  "name": "trade-republic-portfolio-tracker",
+  "name": "trade-republic-api",
   "version": "1.0.0",
-  "description": "Automated Trade Republic portfolio tracking on Render",
-  "main": "render.js",
+  "description": "API service for Trade Republic portfolio data",
+  "main": "server.js",
   "scripts": {
-    "start": "node render.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
     "puppeteer": "^22.1.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "node-fetch": "^3.3.2"
+    "express-rate-limit": "^7.1.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
   }
 }
