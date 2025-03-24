@@ -43,23 +43,16 @@ app.use(apiKeyAuth);
 // Session storage for browser instances
 const sessions = {};
 
-// AUTOMATIC SESSION MAINTENANCE
-// Set up automatic refresh for all active sessions
-const AUTO_REFRESH_INTERVAL = 30 * 60 * 1000; // 30 minutes
+// SUPER AGGRESSIVE AUTOMATIC SESSION MAINTENANCE - EVERY 4 MINUTES
+const AUTO_REFRESH_INTERVAL = 4 * 60 * 1000; // 4 minutes
 
 // Start automatic session refresh
+console.log(`Setting up automatic session maintenance every ${AUTO_REFRESH_INTERVAL/60000} minutes`);
 setInterval(async () => {
   console.log(`[${new Date().toISOString()}] Running automatic session maintenance...`);
   
   for (const sessionId in sessions) {
     const session = sessions[sessionId];
-    
-    // Skip if the session was active recently
-    const now = Date.now();
-    if (now - session.lastActivity < 10 * 60 * 1000) { // 10 minutes
-      console.log(`Session ${sessionId} was active recently, skipping refresh`);
-      continue;
-    }
     
     try {
       console.log(`Refreshing session ${sessionId}...`);
@@ -123,15 +116,15 @@ setInterval(async () => {
   console.log(`[${new Date().toISOString()}] Session maintenance completed`);
 }, AUTO_REFRESH_INTERVAL);
 
-// Cleanup very old sessions periodically (after 7 days)
+// Cleanup stale sessions only after 30 days of inactivity
 setInterval(() => {
   const now = Date.now();
-  const sevenDays = 7 * 24 * 60 * 60 * 1000;
+  const thirtyDays = 30 * 24 * 60 * 60 * 1000;
   
   Object.keys(sessions).forEach(sessionId => {
     const session = sessions[sessionId];
-    // Close browser for sessions older than 7 days
-    if (now - session.lastActivity > sevenDays) {
+    // Only close extremely old sessions (30 days)
+    if (now - session.lastActivity > thirtyDays) {
       console.log(`Closing very old session: ${sessionId}`);
       try {
         if (session.browser) {
@@ -891,6 +884,43 @@ async function getPortfolioData(page, isRefresh = false) {
 
 // Define API routes
 
+// DELETE - Close a session
+app.delete('/api/session/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  
+  // Check if session exists
+  if (!sessionId || !sessions[sessionId]) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  
+  try {
+    console.log(`Closing session ${sessionId} by user request...`);
+    
+    // Close browser
+    if (sessions[sessionId].browser) {
+      await sessions[sessionId].browser.close();
+    }
+    
+    // Delete session
+    delete sessions[sessionId];
+    
+    return res.json({ 
+      success: true, 
+      message: `Session ${sessionId} closed successfully` 
+    });
+  } catch (error) {
+    console.log(`Error closing session ${sessionId}: ${error.message}`);
+    
+    // Delete session regardless of error
+    delete sessions[sessionId];
+    
+    return res.json({ 
+      success: true, 
+      message: `Session ${sessionId} deleted with errors: ${error.message}` 
+    });
+  }
+});
+
 // POST - Start a new session and login
 app.post('/api/login', limiter, async (req, res) => {
   const { phoneNumber, pin, twoFACode } = req.body;
@@ -1183,8 +1213,9 @@ app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
     service: 'Trade Republic API',
-    version: '1.1.0',
-    activeSessions: Object.keys(sessions).length
+    version: '1.2.0',
+    activeSessions: Object.keys(sessions).length,
+    autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000
   });
 });
 
@@ -1309,5 +1340,6 @@ process.on('SIGTERM', async () => {
 // Start the server
 app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
-  console.log(`Automatic session maintenance enabled (every ${AUTO_REFRESH_INTERVAL/60000} minutes)`);
+  console.log(`Automatic session maintenance EVERY ${AUTO_REFRESH_INTERVAL/60000} MINUTES`);
+  console.log(`Sessions will be kept alive for 30 DAYS of inactivity`);
 });
