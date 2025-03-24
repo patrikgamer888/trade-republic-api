@@ -4,6 +4,8 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
 
 // Use stealth plugin to help avoid detection
 puppeteer.use(StealthPlugin());
@@ -18,10 +20,22 @@ app.use(bodyParser.json());
 // IMPORTANT: Fix for Render's proxy environment
 app.set('trust proxy', 1);
 
+// Session storage
+const SESSIONS_DIR = path.join(__dirname, 'sessions');
+const SESSIONS_FILE = path.join(SESSIONS_DIR, 'sessions.json');
+
+// Create sessions directory if it doesn't exist
+if (!fs.existsSync(SESSIONS_DIR)) {
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+}
+
+// In-memory sessions object
+const sessions = {};
+
 // API key middleware
 const apiKeyAuth = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
-  const validApiKey = process.env.API_KEY || 'your-secret-api-key';
+  const validApiKey = process.env.API_KEY || 'a1b2c3d4e5f6g7h8i9j0';
   
   if (!apiKey || apiKey !== validApiKey) {
     return res.status(401).json({ error: 'Unauthorized: Invalid API key' });
@@ -40,11 +54,129 @@ const limiter = rateLimit({
 // Apply API key auth to all routes
 app.use(apiKeyAuth);
 
-// Session storage for browser instances
-const sessions = {};
+// Load saved sessions if available
+try {
+  if (fs.existsSync(SESSIONS_FILE)) {
+    const savedSessionsData = fs.readFileSync(SESSIONS_FILE, 'utf8');
+    const savedSessions = JSON.parse(savedSessionsData);
+    console.log(`Found ${Object.keys(savedSessions).length} saved sessions`);
+    
+    // Store session metadata for restoration
+    Object.keys(savedSessions).forEach(sessionId => {
+      sessions[sessionId] = {
+        ...savedSessions[sessionId],
+        browser: null,
+        page: null,
+        needsRestore: true
+      };
+    });
+  }
+} catch (error) {
+  console.error(`Error loading saved sessions: ${error.message}`);
+}
+
+// Save sessions to file periodically
+function saveSessionsToFile() {
+  try {
+    // Create a version of sessions without browser/page objects
+    const sessionsToSave = {};
+    
+    Object.keys(sessions).forEach(sessionId => {
+      const { browser, page, ...sessionData } = sessions[sessionId];
+      sessionsToSave[sessionId] = sessionData;
+    });
+    
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessionsToSave, null, 2));
+    console.log(`Saved ${Object.keys(sessionsToSave).length} sessions to ${SESSIONS_FILE}`);
+  } catch (error) {
+    console.error(`Error saving sessions: ${error.message}`);
+  }
+}
+
+// Save sessions every 5 minutes
+setInterval(saveSessionsToFile, 5 * 60 * 1000);
 
 // SUPER AGGRESSIVE AUTOMATIC SESSION MAINTENANCE - EVERY 4 MINUTES
 const AUTO_REFRESH_INTERVAL = 4 * 60 * 1000; // 4 minutes
+
+// Restore a session
+async function restoreSession(sessionId) {
+  try {
+    const session = sessions[sessionId];
+    
+    if (!session) {
+      console.log(`Session ${sessionId} not found, cannot restore`);
+      return false;
+    }
+    
+    if (!session.credentials || !session.credentials.phoneNumber || !session.credentials.pin) {
+      console.log(`Session ${sessionId} has no credentials, cannot restore`);
+      return false;
+    }
+    
+    console.log(`Restoring session ${sessionId}...`);
+    
+    // Set up new browser
+    const browser = await setupBrowser();
+    if (!browser) {
+      console.log(`Failed to create browser for session ${sessionId}`);
+      return false;
+    }
+    
+    // Create new page
+    const pages = await browser.pages();
+    const page = pages[0];
+    
+    // Set realistic user agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Navigate to Trade Republic
+    await page.goto("https://app.traderepublic.com/portfolio", { 
+      waitUntil: 'networkidle2',
+      timeout: 30000
+    });
+    
+    // Login
+    const loginResult = await loginToTradeRepublic(page, session.credentials);
+    
+    if (loginResult.success) {
+      console.log(`✅ Successfully restored session ${sessionId}`);
+      
+      // Update session with new browser and page
+      session.browser = browser;
+      session.page = page;
+      session.lastActivity = Date.now();
+      session.needsRestore = false;
+      
+      return true;
+    } else if (loginResult.needs2FA) {
+      console.log(`❌ Cannot automatically restore session ${sessionId} - 2FA required`);
+      
+      // Close browser
+      try {
+        await browser.close();
+      } catch (error) {
+        console.log(`Error closing browser: ${error.message}`);
+      }
+      
+      return false;
+    } else {
+      console.log(`❌ Failed to restore session ${sessionId}: ${loginResult.error}`);
+      
+      // Close browser
+      try {
+        await browser.close();
+      } catch (error) {
+        console.log(`Error closing browser: ${error.message}`);
+      }
+      
+      return false;
+    }
+  } catch (error) {
+    console.log(`Error restoring session ${sessionId}: ${error.message}`);
+    return false;
+  }
+}
 
 // Start automatic session refresh
 console.log(`Setting up automatic session maintenance every ${AUTO_REFRESH_INTERVAL/60000} minutes`);
@@ -53,6 +185,15 @@ setInterval(async () => {
   
   for (const sessionId in sessions) {
     const session = sessions[sessionId];
+    
+    // Check if session needs to be restored (after server restart)
+    if (session.needsRestore) {
+      const restored = await restoreSession(sessionId);
+      if (!restored) {
+        console.log(`Failed to restore session ${sessionId}, will retry later`);
+        continue;
+      }
+    }
     
     try {
       console.log(`Refreshing session ${sessionId}...`);
@@ -114,6 +255,10 @@ setInterval(async () => {
   }
   
   console.log(`[${new Date().toISOString()}] Session maintenance completed`);
+  
+  // Save sessions to file after maintenance
+  saveSessionsToFile();
+  
 }, AUTO_REFRESH_INTERVAL);
 
 // Cleanup stale sessions only after 30 days of inactivity
@@ -136,6 +281,10 @@ setInterval(() => {
       delete sessions[sessionId];
     }
   });
+  
+  // Save sessions to file after cleanup
+  saveSessionsToFile();
+  
 }, 24 * 60 * 60 * 1000); // Run once per day
 
 // Helper functions
@@ -199,12 +348,17 @@ async function setupBrowser() {
     
     // Fallback with minimal settings
     console.log("Trying with minimal settings...");
-    const browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--incognito'],
-      defaultViewport: null
-    });
-    return browser;
+    try {
+      const browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--incognito'],
+        defaultViewport: null
+      });
+      return browser;
+    } catch (fallbackError) {
+      console.log(`Fallback browser setup also failed: ${fallbackError.message}`);
+      return null;
+    }
   }
 }
 
@@ -904,6 +1058,9 @@ app.delete('/api/session/:sessionId', async (req, res) => {
     // Delete session
     delete sessions[sessionId];
     
+    // Save sessions after deletion
+    saveSessionsToFile();
+    
     return res.json({ 
       success: true, 
       message: `Session ${sessionId} closed successfully` 
@@ -913,6 +1070,9 @@ app.delete('/api/session/:sessionId', async (req, res) => {
     
     // Delete session regardless of error
     delete sessions[sessionId];
+    
+    // Save sessions after deletion
+    saveSessionsToFile();
     
     return res.json({ 
       success: true, 
@@ -936,6 +1096,14 @@ app.post('/api/login', limiter, async (req, res) => {
   try {
     // Launch browser
     const browser = await setupBrowser();
+    
+    if (!browser) {
+      return res.status(500).json({ 
+        success: false, 
+        error: 'Failed to launch browser' 
+      });
+    }
+    
     console.log(`✅ Browser launched for session: ${sessionId}`);
     
     // Create session
@@ -975,6 +1143,9 @@ app.post('/api/login', limiter, async (req, res) => {
       // Get portfolio data
       const data = await getPortfolioData(page);
       
+      // Save sessions
+      saveSessionsToFile();
+      
       // Return success with sessionId
       return res.json({
         success: true,
@@ -983,6 +1154,9 @@ app.post('/api/login', limiter, async (req, res) => {
       });
     } else if (loginResult.needs2FA) {
       console.log("\n📱 2FA required");
+      
+      // Save sessions (even though not fully authenticated yet)
+      saveSessionsToFile();
       
       // Return with 2FA required status
       return res.status(200).json({
@@ -1001,6 +1175,9 @@ app.post('/api/login', limiter, async (req, res) => {
       }
       
       delete sessions[sessionId];
+      
+      // Save sessions after deletion
+      saveSessionsToFile();
       
       return res.status(401).json({
         success: false,
@@ -1043,6 +1220,14 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
     return res.status(404).json({ error: 'Session not found or expired' });
   }
   
+  // Check if session needs to be restored
+  if (sessions[sessionId].needsRestore) {
+    const restored = await restoreSession(sessionId);
+    if (!restored) {
+      return res.status(500).json({ error: 'Failed to restore session' });
+    }
+  }
+  
   try {
     // Update last activity timestamp
     sessions[sessionId].lastActivity = Date.now();
@@ -1072,6 +1257,9 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
         
         // Get portfolio data
         const data = await getPortfolioData(page);
+        
+        // Save sessions
+        saveSessionsToFile();
         
         // Return success with data
         return res.json({
@@ -1113,6 +1301,14 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
   // Check if session exists
   if (!sessionId || !sessions[sessionId]) {
     return res.status(404).json({ error: 'Session not found or expired' });
+  }
+  
+  // Check if session needs to be restored
+  if (sessions[sessionId].needsRestore) {
+    const restored = await restoreSession(sessionId);
+    if (!restored) {
+      return res.status(500).json({ error: 'Failed to restore session' });
+    }
   }
   
   try {
@@ -1213,9 +1409,10 @@ app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
     service: 'Trade Republic API',
-    version: '1.2.0',
+    version: '1.3.0',
     activeSessions: Object.keys(sessions).length,
-    autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000
+    autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000,
+    persistence: true
   });
 });
 
@@ -1237,6 +1434,14 @@ app.post('/api/portfolio', limiter, async (req, res) => {
     
     // Launch browser
     const browser = await setupBrowser();
+    
+    if (!browser) {
+      return res.status(500).json({ 
+        success: false, 
+        error: 'Failed to launch browser' 
+      });
+    }
+    
     console.log(`✅ Browser launched for session: ${sessionId}`);
     
     // Create session
@@ -1276,6 +1481,9 @@ app.post('/api/portfolio', limiter, async (req, res) => {
       // Get portfolio data
       const data = await getPortfolioData(page);
       
+      // Save sessions
+      saveSessionsToFile();
+      
       // Return success with sessionId and data in the old format for compatibility
       return res.json({
         success: true,
@@ -1285,6 +1493,9 @@ app.post('/api/portfolio', limiter, async (req, res) => {
       });
     } else if (loginResult.needs2FA) {
       console.log("\n📱 2FA required");
+      
+      // Save sessions
+      saveSessionsToFile();
       
       // Return with 2FA required status in a format compatible with old clients
       return res.status(401).json({
@@ -1319,21 +1530,54 @@ app.post('/api/portfolio', limiter, async (req, res) => {
   }
 });
 
-// Graceful shutdown
+// Graceful shutdown - Save sessions before closing
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
+  console.log('SIGTERM received, saving sessions before shutdown...');
   
-  // Close all browser instances
+  // Save all sessions to file
+  saveSessionsToFile();
+  
+  // Close all browsers, but don't delete the sessions from memory
+  // This way they can be restored when the server restarts
   for (const sessionId in sessions) {
     try {
       if (sessions[sessionId].browser) {
         await sessions[sessionId].browser.close();
+        sessions[sessionId].browser = null;
+        sessions[sessionId].page = null;
+        sessions[sessionId].needsRestore = true;
       }
     } catch (error) {
       console.log(`Error closing browser for session ${sessionId}: ${error.message}`);
     }
   }
   
+  console.log('Graceful shutdown complete');
+  process.exit(0);
+});
+
+// Same for SIGINT
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, saving sessions before shutdown...');
+  
+  // Save all sessions to file
+  saveSessionsToFile();
+  
+  // Close all browsers, but don't delete the sessions
+  for (const sessionId in sessions) {
+    try {
+      if (sessions[sessionId].browser) {
+        await sessions[sessionId].browser.close();
+        sessions[sessionId].browser = null;
+        sessions[sessionId].page = null;
+        sessions[sessionId].needsRestore = true;
+      }
+    } catch (error) {
+      console.log(`Error closing browser for session ${sessionId}: ${error.message}`);
+    }
+  }
+  
+  console.log('Graceful shutdown complete');
   process.exit(0);
 });
 
@@ -1342,4 +1586,5 @@ app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
   console.log(`Automatic session maintenance EVERY ${AUTO_REFRESH_INTERVAL/60000} MINUTES`);
   console.log(`Sessions will be kept alive for 30 DAYS of inactivity`);
+  console.log(`Session persistence ENABLED - Sessions will survive server restarts`);
 });
