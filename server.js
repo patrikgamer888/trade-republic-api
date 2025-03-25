@@ -21,8 +21,49 @@ const PORT = process.env.PORT || 10000;
 const PING_INTERVAL = 10 * 60 * 1000; // 10 minutes
 const SERVICE_URL = process.env.SERVICE_URL || 'https://trade-republic-api.onrender.com';
 
+// Request lock system to prevent interference
+const requestLocks = {
+  isProcessingUserRequest: false,
+  pendingUserRequest: null,
+  
+  // Acquire lock for user request
+  async acquireUserLock() {
+    if (this.isProcessingUserRequest) {
+      // Create a promise that will be resolved when the current request completes
+      return new Promise(resolve => {
+        this.pendingUserRequest = resolve;
+      });
+    } else {
+      this.isProcessingUserRequest = true;
+      return Promise.resolve();
+    }
+  },
+  
+  // Release lock after user request
+  releaseUserLock() {
+    this.isProcessingUserRequest = false;
+    
+    // If there's a pending request, allow it to proceed
+    if (this.pendingUserRequest) {
+      const resolve = this.pendingUserRequest;
+      this.pendingUserRequest = null;
+      resolve();
+    }
+  },
+  
+  // Check if an automatic process can run
+  canRunAutomaticProcess() {
+    return !this.isProcessingUserRequest;
+  }
+};
+
 // Function to ping our own service
 function pingService() {
+  if (!requestLocks.canRunAutomaticProcess()) {
+    console.log("Skipping self-ping due to active user request");
+    return;
+  }
+  
   console.log(`[${new Date().toISOString()}] Pinging service to prevent spin-down: ${SERVICE_URL}`);
   
   const url = new URL(SERVICE_URL);
@@ -125,7 +166,7 @@ try {
   console.error(`Error loading saved sessions: ${error.message}`);
 }
 
-// Save sessions to file periodically
+// Save sessions to file periodically (reduced frequency and logging)
 function saveSessionsToFile() {
   try {
     // Create a version of sessions without browser/page objects
@@ -137,17 +178,18 @@ function saveSessionsToFile() {
     });
     
     fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessionsToSave, null, 2));
-    console.log(`Saved ${Object.keys(sessionsToSave).length} sessions to ${SESSIONS_FILE}`);
+    // Reduced logging - only log count, not path
+    console.log(`Saved ${Object.keys(sessionsToSave).length} sessions`);
   } catch (error) {
     console.error(`Error saving sessions: ${error.message}`);
   }
 }
 
-// Save sessions every 5 minutes
-setInterval(saveSessionsToFile, 5 * 60 * 1000);
+// Save sessions less frequently - every 15 minutes instead of 5
+setInterval(saveSessionsToFile, 15 * 60 * 1000);
 
-// SUPER AGGRESSIVE AUTOMATIC SESSION MAINTENANCE - EVERY 4 MINUTES
-const AUTO_REFRESH_INTERVAL = 4 * 60 * 1000; // 4 minutes
+// AUTOMATIC SESSION MAINTENANCE - REDUCED FREQUENCY
+const AUTO_REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes (increased from 4)
 
 // Restore a session
 async function restoreSession(sessionId) {
@@ -228,9 +270,15 @@ async function restoreSession(sessionId) {
   }
 }
 
-// Start automatic session refresh
+// Start automatic session maintenance (with lock checks)
 console.log(`Setting up automatic session maintenance every ${AUTO_REFRESH_INTERVAL/60000} minutes`);
 setInterval(async () => {
+  // Skip automatic maintenance if there's a user request in progress
+  if (!requestLocks.canRunAutomaticProcess()) {
+    console.log(`[${new Date().toISOString()}] Skipping automatic session maintenance due to active user request`);
+    return;
+  }
+  
   console.log(`[${new Date().toISOString()}] Running automatic session maintenance...`);
   
   for (const sessionId in sessions) {
@@ -260,33 +308,11 @@ setInterval(async () => {
       const isLoggedIn = await checkIfLoggedIn(page);
       
       if (!isLoggedIn) {
-        console.log(`Session ${sessionId} is not logged in, attempting to reconnect...`);
+        console.log(`Session ${sessionId} is not logged in. Marking for deletion.`);
         
-        // Try automatic re-login
-        const credentials = session.credentials;
-        
-        if (credentials && credentials.phoneNumber && credentials.pin) {
-          console.log("Attempting automatic re-login...");
-          
-          // Navigate back to portfolio
-          await page.goto("https://app.traderepublic.com/portfolio", { 
-            waitUntil: 'networkidle2',
-            timeout: 30000
-          });
-          
-          // Login again
-          const loginResult = await loginToTradeRepublic(page, credentials);
-          
-          if (loginResult.success) {
-            console.log(`✅ Automatic re-login successful for session ${sessionId}`);
-            session.lastActivity = Date.now();
-          } else {
-            console.log(`❌ Automatic re-login failed for session ${sessionId}`);
-            // Keep the session, we'll try again later
-          }
-        } else {
-          console.log(`No credentials for session ${sessionId}, can't reconnect`);
-        }
+        // Instead of automatic re-login, mark the session for deletion
+        // This will allow it to be properly cleaned up in the next cleanup cycle
+        session.needsDeletion = true;
       } else {
         console.log(`Session ${sessionId} is still logged in`);
         
@@ -306,21 +332,36 @@ setInterval(async () => {
   
   console.log(`[${new Date().toISOString()}] Session maintenance completed`);
   
-  // Save sessions to file after maintenance
+  // Save sessions to file after maintenance (but with reduced detail)
   saveSessionsToFile();
   
 }, AUTO_REFRESH_INTERVAL);
 
-// Cleanup stale sessions only after 30 days of inactivity
+// Cleanup stale sessions - check more frequently
 setInterval(() => {
   const now = Date.now();
-  const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+  const oneDay = 24 * 60 * 60 * 1000;
   
   Object.keys(sessions).forEach(sessionId => {
     const session = sessions[sessionId];
-    // Only close extremely old sessions (30 days)
-    if (now - session.lastActivity > thirtyDays) {
-      console.log(`Closing very old session: ${sessionId}`);
+    
+    // Close sessions marked for deletion
+    if (session.needsDeletion) {
+      console.log(`Closing session marked for deletion: ${sessionId}`);
+      try {
+        if (session.browser) {
+          session.browser.close();
+        }
+      } catch (error) {
+        console.error(`Error closing browser: ${error.message}`);
+      }
+      delete sessions[sessionId];
+      return;
+    }
+    
+    // Or close sessions inactive for 1 day (reduced from 30 days)
+    if (now - session.lastActivity > oneDay) {
+      console.log(`Closing inactive session: ${sessionId}`);
       try {
         if (session.browser) {
           session.browser.close();
@@ -335,7 +376,7 @@ setInterval(() => {
   // Save sessions to file after cleanup
   saveSessionsToFile();
   
-}, 24 * 60 * 60 * 1000); // Run once per day
+}, 2 * 60 * 60 * 1000); // Run every 2 hours
 
 // Helper functions
 
@@ -346,14 +387,12 @@ function sleep(ms) {
 
 // Fast typing function
 async function fastType(page, selector, text) {
-  console.log(`Typing into ${selector}...`);
   await page.focus(selector);
   await page.keyboard.type(text, {delay: 0});
-  console.log("Typing complete");
 }
 
-// Wait for element function
-async function waitForElement(page, selector, timeout = 5000, description = "element") {
+// Wait for element function (optimized with faster timeouts)
+async function waitForElement(page, selector, timeout = 3000, description = "element") {
   try {
     console.log(`👀 Looking for: ${description}`);
     const element = await page.waitForSelector(selector, { 
@@ -415,8 +454,6 @@ async function setupBrowser() {
 // Check if already logged in
 async function checkIfLoggedIn(page) {
   try {
-    console.log("Checking login status...");
-    
     const loggedInIndicators = [
       ".currencyStatus",
       ".portfolioInstrumentList",
@@ -436,7 +473,6 @@ async function checkIfLoggedIn(page) {
           }, element);
           
           if (isVisible) {
-            console.log("✅ Already logged in");
             return true;
           }
         }
@@ -450,11 +486,9 @@ async function checkIfLoggedIn(page) {
     if (currentUrl.includes('/portfolio') || 
         currentUrl.includes('/dashboard') || 
         currentUrl.includes('/timeline')) {
-      console.log("✅ Already logged in (based on URL)");
       return true;
     }
     
-    console.log("Not logged in yet");
     return false;
   } catch (error) {
     console.log(`Error checking login status: ${error.message}`);
@@ -465,8 +499,6 @@ async function checkIfLoggedIn(page) {
 // Handle cookie consent
 async function handleCookieConsent(page) {
   try {
-    console.log("Checking for cookie consent dialog...");
-    
     const cookieSelectors = [
       "button.buttonBase.consentCard__action.buttonPrimary",
       ".buttonBase.consentCard__action.buttonPrimary",
@@ -478,7 +510,6 @@ async function handleCookieConsent(page) {
       try {
         const cookieButton = await page.$(selector);
         if (cookieButton) {
-          console.log(`Found cookie button: ${selector}`);
           await cookieButton.click();
           console.log("✅ Accepted cookies");
           return true;
@@ -488,7 +519,6 @@ async function handleCookieConsent(page) {
       }
     }
     
-    console.log("No cookie consent dialog found");
     return false;
   } catch (error) {
     console.log(`Error handling cookie consent: ${error.message}`);
@@ -499,18 +529,15 @@ async function handleCookieConsent(page) {
 // Enter phone number
 async function enterPhoneNumber(page, phoneNumber) {
   try {
-    console.log("Starting phone number entry...");
-    
     // Wait for phone number field
     const phoneField = await waitForElement(
       page, 
       "#loginPhoneNumber__input", 
-      10000, 
+      5000, 
       "phone number field"
     );
     
     if (!phoneField) {
-      console.log("❌ Phone number field not found");
       return false;
     }
     
@@ -521,12 +548,9 @@ async function enterPhoneNumber(page, phoneNumber) {
     });
     
     // Fast type phone number - no delays
-    console.log(`Entering phone number: ${phoneNumber.substring(0, 2)}***`);
     await fastType(page, "#loginPhoneNumber__input", phoneNumber);
     
     // Try to find next button
-    console.log("Looking for next button...");
-    
     const nextButtonSelectors = [
       "button.buttonBase.loginPhoneNumber__action.buttonPrimary",
       ".buttonBase.loginPhoneNumber__action",
@@ -538,17 +562,14 @@ async function enterPhoneNumber(page, phoneNumber) {
     for (const selector of nextButtonSelectors) {
       try {
         // Wait specifically for this button
-        const nextButton = await waitForElement(page, selector, 5000, `next button (${selector})`);
+        const nextButton = await waitForElement(page, selector, 3000, `next button (${selector})`);
         
         if (nextButton) {
-          console.log(`Clicking next button: ${selector}`);
           await nextButton.click();
-          
-          console.log("✅ Clicked next button");
           clicked = true;
           
           // Brief wait for next page to load
-          await sleep(500);
+          await sleep(300);
           break;
         }
       } catch (error) {
@@ -557,7 +578,6 @@ async function enterPhoneNumber(page, phoneNumber) {
     }
     
     if (!clicked) {
-      console.log("❌ Could not find or click any next button");
       return false;
     }
     
@@ -568,36 +588,27 @@ async function enterPhoneNumber(page, phoneNumber) {
   }
 }
 
-// Enter PIN
+// Enter PIN (optimized for speed)
 async function enterPIN(page, pin) {
   try {
-    console.log("Starting PIN entry...");
-    
     // Brief wait for PIN field to appear
-    await sleep(500);
+    await sleep(300);
     
     // Try to find PIN input
-    console.log("Looking for PIN input fields...");
-    
     // First try with specific class
     let pinInputs = await page.$$('fieldset#loginPin__input input.codeInput__character[type="password"]');
     
     // If not found, try more generic selector
     if (!pinInputs || pinInputs.length === 0) {
-      console.log("Trying alternative PIN selector...");
       pinInputs = await page.$$('#loginPin__input input[type="password"]');
     }
     
     // Last resort - try any password input
     if (!pinInputs || pinInputs.length === 0) {
-      console.log("Trying any password input as last resort...");
       pinInputs = await page.$$('input[type="password"]');
     }
     
-    console.log(`Found ${pinInputs.length} PIN input fields`);
-    
     if (pinInputs.length === 0) {
-      console.log("❌ No PIN input fields found");
       return false;
     }
     
@@ -614,11 +625,8 @@ async function enterPIN(page, pin) {
       }
     }
     
-    console.log("✅ PIN entry complete");
-    
-    // Wait for PIN processing but reduced time
-    console.log("Waiting for PIN processing...");
-    await sleep(1500);
+    // Shorter wait for PIN processing
+    await sleep(800);
     
     return true;
   } catch (error) {
@@ -630,8 +638,6 @@ async function enterPIN(page, pin) {
 // Handle 2FA
 async function handle2FA(page, twoFACode) {
   try {
-    console.log("Checking if 2FA is required...");
-    
     // Check for 2FA input
     const is2FARequired = await page.evaluate(() => {
       return !!document.querySelector('#smsCode__input') || 
@@ -639,22 +645,19 @@ async function handle2FA(page, twoFACode) {
     });
     
     if (!is2FARequired) {
-      console.log("No 2FA required");
       return { success: true, needs2FA: false };
     }
     
     console.log("📱 2FA authentication required");
     
     if (!twoFACode) {
-      console.log("No 2FA code provided, client needs to submit code");
       return { success: false, needs2FA: true };
     }
     
     // Wait for SMS code field
-    const smsField = await waitForElement(page, "#smsCode__input", 5000, "2FA input field");
+    const smsField = await waitForElement(page, "#smsCode__input", 3000, "2FA input field");
     
     if (!smsField) {
-      console.log("❌ 2FA input field not found");
       return { success: false, needs2FA: true, error: "2FA input field not found" };
     }
     
@@ -662,7 +665,6 @@ async function handle2FA(page, twoFACode) {
     const smsInputs = await page.$$('#smsCode__input input');
     
     if (smsInputs.length === 0) {
-      console.log("❌ No 2FA input fields found");
       return { success: false, needs2FA: true, error: "No 2FA input fields found" };
     }
     
@@ -677,10 +679,8 @@ async function handle2FA(page, twoFACode) {
       }
     }
     
-    console.log("✅ 2FA code entered");
-    
     // Brief wait for processing
-    await sleep(1000);
+    await sleep(500);
     
     return { success: true, needs2FA: false };
   } catch (error) {
@@ -739,9 +739,8 @@ async function loginToTradeRepublic(page, credentials) {
       };
     }
     
-    // Wait for login to complete
-    console.log("Waiting for login to complete...");
-    await sleep(2000);
+    // Wait for login to complete (shorter wait)
+    await sleep(1000);
     
     // Final check to verify login success
     const isLoggedIn = await checkIfLoggedIn(page);
@@ -763,37 +762,30 @@ async function loginToTradeRepublic(page, credentials) {
   }
 }
 
-// Function to click dropdown (was missing)
+// Function to click dropdown - optimized
 async function clickSinceBuyEuroOption(page) {
   try {
-    console.log("\n🔄 Setting view to 'Since buy (€)'...");
-    
     // Find and click dropdown button
-    console.log("Looking for dropdown button...");
     const dropdownButtonSelector = ".dropdownList__openButton";
     try {
       await page.click(dropdownButtonSelector);
-      console.log("✅ Clicked dropdown button");
     } catch (clickError) {
-      console.log(`❌ Failed to click dropdown button: ${clickError.message}`);
       return false;
     }
     
     // Brief wait for dropdown to appear
-    await sleep(500);
+    await sleep(300);
     
     // Try multiple selection methods in sequence
     const selectionMethods = [
       // Direct click by ID
       async () => {
-        console.log("Trying to click by ID...");
         await page.click("#investments-sinceBuyabs");
         return true;
       },
       
       // Try by paragraph class
       async () => {
-        console.log("Trying by paragraph class...");
         const found = await page.evaluate(() => {
           const paragraphs = document.querySelectorAll('p.dropdownList__optionName');
           for (let i = 0; i < paragraphs.length; i++) {
@@ -813,7 +805,6 @@ async function clickSinceBuyEuroOption(page) {
       
       // Try direct XPath
       async () => {
-        console.log("Trying XPath method...");
         const [element] = await page.$x("//p[contains(text(), 'Since buy') and contains(text(), '€')]/ancestor::li");
         if (element) {
           await element.click();
@@ -827,8 +818,7 @@ async function clickSinceBuyEuroOption(page) {
     for (const method of selectionMethods) {
       try {
         if (await method()) {
-          console.log("✅ Selected 'Since buy (€)' option");
-          await sleep(500);
+          await sleep(300);
           return true;
         }
       } catch (error) {
@@ -836,7 +826,6 @@ async function clickSinceBuyEuroOption(page) {
       }
     }
     
-    console.log("❌ Could not find or click 'Since buy (€)' option");
     return false;
   } catch (error) {
     console.log(`Error setting view: ${error.message}`);
@@ -844,7 +833,7 @@ async function clickSinceBuyEuroOption(page) {
   }
 }
 
-// Get portfolio data
+// Get portfolio data (optimized for speed)
 async function getPortfolioData(page, isRefresh = false) {
   const data = {
     portfolio_balance: "Not available",
@@ -878,18 +867,13 @@ async function getPortfolioData(page, isRefresh = false) {
     
     // Set view to show "Since buy (€)" - but only on first load, not on refresh
     if (!isRefresh) {
-      console.log("\nSetting view to show Euro values...");
       await clickSinceBuyEuroOption(page);
-    } else {
-      console.log("Skipping dropdown selection (using existing view)");
     }
     
     // Get all position data
     try {
-      console.log("Looking for portfolio positions...");
-      
-      // Wait for portfolio list to become available
-      await sleep(1500);
+      // Reduced wait time
+      await sleep(800);
       
       // Get all position data with multiple selector attempts
       const positions = await page.evaluate(() => {
@@ -911,7 +895,6 @@ async function getPortfolioData(page, isRefresh = false) {
         for (const selector of possibleListSelectors) {
           list = document.querySelector(selector);
           if (list) {
-            console.log(`Found list with selector: ${selector}`);
             items = list.querySelectorAll('li');
             if (items.length > 0) break;
           }
@@ -919,11 +902,8 @@ async function getPortfolioData(page, isRefresh = false) {
         
         // If we still don't have items, try a more generic approach
         if (items.length === 0) {
-          console.log("Trying generic approach to find positions");
           items = document.querySelectorAll('[class*="instrumentListItem"], [class*="positionItem"]');
         }
-        
-        console.log(`Found ${items.length} potential position items`);
         
         // Process each position with multiple possible selectors
         for (let i = 0; i < items.length; i++) {
@@ -995,15 +975,15 @@ async function getPortfolioData(page, isRefresh = false) {
       console.log(`Found ${positions.length} positions`);
       
       if (positions.length === 0) {
-        console.log("⚠️ No positions found. Waiting longer and trying one more time...");
-        await sleep(3000);
+        console.log("⚠️ No positions found. Waiting a bit longer...");
+        await sleep(1500);
         
-        // One more attempt with forced page reload
-        await page.reload({ waitUntil: 'networkidle2' });
-        await sleep(3000);
+        // One more attempt with forced page reload - faster than before
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await sleep(1500);
         
         const retryPositions = await page.evaluate(() => {
-          // Same logic as above, but simplified for brevity
+          // Simplified logic for retry
           const results = [];
           const items = document.querySelectorAll('[class*="instrumentListItem"], [class*="positionItem"], li');
           
@@ -1029,51 +1009,35 @@ async function getPortfolioData(page, isRefresh = false) {
         }
       } else {
         // Add positions to data
-        positions.forEach((pos, index) => {
-          console.log(`📊 Position ${index+1}: ${pos.name} (${pos.id})`);
-          console.log(`   Shares: ${pos.shares}`);
-          console.log(`   Value: ${pos.total_value}`);
-          data.positions.push(pos);
-        });
+        data.positions = positions;
       }
       
     } catch (error) {
       console.log(`Error getting positions: ${error.message}`);
     }
     
-    // Get cash balance by navigating to transactions page
+    // Get cash balance by navigating to transactions page - faster approach
     try {
-      console.log("\n💵 Looking for cash balance...");
-      
-      // Navigate to transactions page
-      console.log("Navigating to transactions page...");
-      
       // Find the transactions link
       const transactionsLink = await page.$('a.navigationItem__link[href="/profile/transactions"]');
       
       if (transactionsLink) {
         // Click the link
         await transactionsLink.click();
-        console.log("Clicked transactions link");
         
-        // Brief wait for page to load
-        await sleep(1000);
+        // Shorter wait for page to load
+        await sleep(500);
         
         // Find the cash balance element
         const cashBalanceElement = await page.$('.cashBalance__amount');
         if (cashBalanceElement) {
           data.cash_balance = await page.evaluate(el => el.textContent.trim(), cashBalanceElement);
           console.log(`💰 Cash balance: ${data.cash_balance}`);
-        } else {
-          console.log("Cash balance element not found on transactions page");
         }
         
         // Navigate back to portfolio
-        console.log("Navigating back to portfolio...");
         await page.goBack();
-        await sleep(1000);
-      } else {
-        console.log("Could not find transactions link");
+        await sleep(500);
       }
     } catch (error) {
       console.log(`Error getting cash balance: ${error.message}`);
@@ -1143,10 +1107,14 @@ app.delete('/api/session/:sessionId', async (req, res) => {
 
 // POST - Start a new session and login
 app.post('/api/login', limiter, async (req, res) => {
+  // Acquire user request lock
+  await requestLocks.acquireUserLock();
+  
   const { phoneNumber, pin, twoFACode } = req.body;
   
   // Validate inputs
   if (!phoneNumber || !pin) {
+    requestLocks.releaseUserLock();
     return res.status(400).json({ error: 'Phone number and PIN are required' });
   }
   
@@ -1158,6 +1126,7 @@ app.post('/api/login', limiter, async (req, res) => {
     const browser = await setupBrowser();
     
     if (!browser) {
+      requestLocks.releaseUserLock();
       return res.status(500).json({ 
         success: false, 
         error: 'Failed to launch browser' 
@@ -1186,8 +1155,8 @@ app.post('/api/login', limiter, async (req, res) => {
     // Navigate to Trade Republic
     console.log("\n🌐 Opening Trade Republic portfolio...");
     await page.goto("https://app.traderepublic.com/portfolio", { 
-      waitUntil: 'networkidle2',
-      timeout: 30000
+      waitUntil: 'domcontentloaded', // Changed from networkidle2 for speed
+      timeout: 20000
     });
     console.log("✅ Trade Republic page loaded");
     
@@ -1206,6 +1175,9 @@ app.post('/api/login', limiter, async (req, res) => {
       // Save sessions
       saveSessionsToFile();
       
+      // Release lock
+      requestLocks.releaseUserLock();
+      
       // Return success with sessionId
       return res.json({
         success: true,
@@ -1217,6 +1189,9 @@ app.post('/api/login', limiter, async (req, res) => {
       
       // Save sessions (even though not fully authenticated yet)
       saveSessionsToFile();
+      
+      // Release lock
+      requestLocks.releaseUserLock();
       
       // Return with 2FA required status
       return res.status(200).json({
@@ -1239,6 +1214,9 @@ app.post('/api/login', limiter, async (req, res) => {
       // Save sessions after deletion
       saveSessionsToFile();
       
+      // Release lock
+      requestLocks.releaseUserLock();
+      
       return res.status(401).json({
         success: false,
         error: loginResult.error || 'Login failed - check credentials'
@@ -1259,6 +1237,9 @@ app.post('/api/login', limiter, async (req, res) => {
     
     delete sessions[sessionId];
     
+    // Release lock
+    requestLocks.releaseUserLock();
+    
     return res.status(500).json({ 
       success: false,
       error: 'Server error: ' + error.message 
@@ -1268,15 +1249,20 @@ app.post('/api/login', limiter, async (req, res) => {
 
 // POST - Submit 2FA code for an existing session
 app.post('/api/submit-2fa', limiter, async (req, res) => {
+  // Acquire user request lock
+  await requestLocks.acquireUserLock();
+  
   const { sessionId, twoFACode } = req.body;
   
   // Validate inputs
   if (!sessionId || !twoFACode) {
+    requestLocks.releaseUserLock();
     return res.status(400).json({ error: 'Session ID and 2FA code are required' });
   }
   
   // Check if session exists
   if (!sessions[sessionId]) {
+    requestLocks.releaseUserLock();
     return res.status(404).json({ error: 'Session not found or expired' });
   }
   
@@ -1284,6 +1270,7 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
   if (sessions[sessionId].needsRestore) {
     const restored = await restoreSession(sessionId);
     if (!restored) {
+      requestLocks.releaseUserLock();
       return res.status(500).json({ error: 'Failed to restore session' });
     }
   }
@@ -1296,6 +1283,7 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
     const page = sessions[sessionId].page;
     
     if (!page) {
+      requestLocks.releaseUserLock();
       return res.status(500).json({ error: 'Session page not found' });
     }
     
@@ -1305,9 +1293,8 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
     if (twoFAResult.success) {
       console.log("✅ 2FA verification successful");
       
-      // Wait for login to complete
-      console.log("Waiting for login to complete...");
-      await sleep(2000);
+      // Wait for login to complete (shorter wait)
+      await sleep(1000);
       
       // Check login status
       const isLoggedIn = await checkIfLoggedIn(page);
@@ -1321,6 +1308,9 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
         // Save sessions
         saveSessionsToFile();
         
+        // Release lock
+        requestLocks.releaseUserLock();
+        
         // Return success with data
         return res.json({
           success: true,
@@ -1330,6 +1320,7 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
       } else {
         console.log("❌ Login failed after 2FA");
         
+        requestLocks.releaseUserLock();
         return res.status(401).json({
           success: false,
           error: 'Login failed after 2FA verification'
@@ -1338,6 +1329,7 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
     } else {
       console.log("❌ 2FA verification failed");
       
+      requestLocks.releaseUserLock();
       return res.status(401).json({
         success: false,
         error: twoFAResult.error || '2FA verification failed'
@@ -1347,6 +1339,7 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
   } catch (error) {
     console.log(`❌ Error during 2FA submission: ${error.message}`);
     
+    requestLocks.releaseUserLock();
     return res.status(500).json({ 
       success: false,
       error: 'Server error: ' + error.message 
@@ -1356,10 +1349,14 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
 
 // GET - Refresh portfolio data for an existing session
 app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
+  // Acquire user request lock
+  await requestLocks.acquireUserLock();
+  
   const { sessionId } = req.params;
   
   // Check if session exists
   if (!sessionId || !sessions[sessionId]) {
+    requestLocks.releaseUserLock();
     return res.status(404).json({ error: 'Session not found or expired' });
   }
   
@@ -1367,6 +1364,7 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
   if (sessions[sessionId].needsRestore) {
     const restored = await restoreSession(sessionId);
     if (!restored) {
+      requestLocks.releaseUserLock();
       return res.status(500).json({ error: 'Failed to restore session' });
     }
   }
@@ -1379,6 +1377,7 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
     const page = sessions[sessionId].page;
     
     if (!page) {
+      requestLocks.releaseUserLock();
       return res.status(500).json({ error: 'Session page not found' });
     }
     
@@ -1388,43 +1387,12 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
     if (!isLoggedIn) {
       console.log("❌ Session expired, need to login again");
       
-      // Try automatic re-login
-      const credentials = sessions[sessionId].credentials;
-      
-      if (credentials && credentials.phoneNumber && credentials.pin) {
-        console.log("Attempting automatic re-login...");
-        
-        // Navigate back to portfolio
-        await page.goto("https://app.traderepublic.com/portfolio", { 
-          waitUntil: 'networkidle2',
-          timeout: 30000
-        });
-        
-        // Login again
-        const loginResult = await loginToTradeRepublic(page, credentials);
-        
-        if (loginResult.success) {
-          console.log("✅ Automatic re-login successful");
-        } else if (loginResult.needs2FA) {
-          console.log("❌ 2FA required for re-login, cannot proceed automatically");
-          return res.status(401).json({
-            success: false,
-            needs2FA: true,
-            error: 'Session expired and 2FA required for re-login'
-          });
-        } else {
-          console.log("❌ Automatic re-login failed");
-          return res.status(401).json({
-            success: false,
-            error: 'Session expired and automatic re-login failed'
-          });
-        }
-      } else {
-        return res.status(401).json({
-          success: false,
-          error: 'Session expired, please login again'
-        });
-      }
+      // Instead of automatic re-login, just report failure
+      requestLocks.releaseUserLock();
+      return res.status(401).json({
+        success: false,
+        error: 'Session expired, please login again'
+      });
     }
     
     // Refresh portfolio data
@@ -1435,18 +1403,21 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
     if (!currentUrl.includes('/portfolio')) {
       console.log("Not on portfolio page, navigating to portfolio...");
       await page.goto("https://app.traderepublic.com/portfolio", { 
-        waitUntil: 'networkidle2',
-        timeout: 15000
+        waitUntil: 'domcontentloaded', // For faster loading
+        timeout: 10000
       });
-      await sleep(2000); // Wait for page to load
+      await sleep(1000); // Shorter wait for page to load
     } else {
-      // Just refresh the current page
-      await page.reload({ waitUntil: 'networkidle2' });
-      await sleep(2000); // Wait for page to load
+      // Just refresh the current page with faster load option
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await sleep(1000); // Shorter wait
     }
     
     // Get updated portfolio data
     const data = await getPortfolioData(page, true);
+    
+    // Release lock
+    requestLocks.releaseUserLock();
     
     // Return success with data
     return res.json({
@@ -1457,6 +1428,7 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
   } catch (error) {
     console.log(`❌ Error during refresh: ${error.message}`);
     
+    requestLocks.releaseUserLock();
     return res.status(500).json({ 
       success: false,
       error: 'Server error: ' + error.message 
@@ -1469,7 +1441,7 @@ app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
     service: 'Trade Republic API',
-    version: '1.4.0',
+    version: '2.0.0',
     activeSessions: Object.keys(sessions).length,
     autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000,
     autoPingMinutes: PING_INTERVAL / 60000,
@@ -1480,13 +1452,16 @@ app.get('/api/status', (req, res) => {
 
 // For backwards compatibility - map old endpoint to new login endpoint
 app.post('/api/portfolio', limiter, async (req, res) => {
-  // Just forward to the login endpoint
+  // Acquire user request lock
+  await requestLocks.acquireUserLock();
+  
   console.log("Legacy /api/portfolio endpoint called, forwarding to /api/login");
   
   // Forward the request to /api/login handler
   const { phoneNumber, pin, twoFACode } = req.body;
   
   if (!phoneNumber || !pin) {
+    requestLocks.releaseUserLock();
     return res.status(400).json({ error: 'Phone number and PIN are required' });
   }
   
@@ -1498,6 +1473,7 @@ app.post('/api/portfolio', limiter, async (req, res) => {
     const browser = await setupBrowser();
     
     if (!browser) {
+      requestLocks.releaseUserLock();
       return res.status(500).json({ 
         success: false, 
         error: 'Failed to launch browser' 
@@ -1526,8 +1502,8 @@ app.post('/api/portfolio', limiter, async (req, res) => {
     // Navigate to Trade Republic
     console.log("\n🌐 Opening Trade Republic portfolio...");
     await page.goto("https://app.traderepublic.com/portfolio", { 
-      waitUntil: 'networkidle2',
-      timeout: 30000
+      waitUntil: 'domcontentloaded',
+      timeout: 20000
     });
     console.log("✅ Trade Republic page loaded");
     
@@ -1546,6 +1522,9 @@ app.post('/api/portfolio', limiter, async (req, res) => {
       // Save sessions
       saveSessionsToFile();
       
+      // Release lock
+      requestLocks.releaseUserLock();
+      
       // Return success with sessionId and data in the old format for compatibility
       return res.json({
         success: true,
@@ -1558,6 +1537,9 @@ app.post('/api/portfolio', limiter, async (req, res) => {
       
       // Save sessions
       saveSessionsToFile();
+      
+      // Release lock
+      requestLocks.releaseUserLock();
       
       // Return with 2FA required status in a format compatible with old clients
       return res.status(401).json({
@@ -1578,6 +1560,9 @@ app.post('/api/portfolio', limiter, async (req, res) => {
       
       delete sessions[sessionId];
       
+      // Release lock
+      requestLocks.releaseUserLock();
+      
       return res.status(401).json({
         success: false,
         error: loginResult.error || 'Login failed - check credentials'
@@ -1585,6 +1570,10 @@ app.post('/api/portfolio', limiter, async (req, res) => {
     }
   } catch (error) {
     console.log(`❌ Error: ${error.message}`);
+    
+    // Release lock
+    requestLocks.releaseUserLock();
+    
     return res.status(500).json({ 
       success: false,
       error: 'Server error: ' + error.message 
@@ -1651,6 +1640,6 @@ app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
   console.log(`Automatic session maintenance EVERY ${AUTO_REFRESH_INTERVAL/60000} MINUTES`);
   console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
-  console.log(`Sessions will be kept alive for 30 DAYS of inactivity`);
+  console.log(`Request locks enabled to prevent interference`);
   console.log(`Session persistence ENABLED - Sessions will survive server restarts`);
 });
