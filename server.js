@@ -6,8 +6,6 @@ const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const http = require('http');
 
 // Use stealth plugin to help avoid detection
 puppeteer.use(StealthPlugin());
@@ -15,49 +13,6 @@ puppeteer.use(StealthPlugin());
 // Create Express app
 const app = express();
 const PORT = process.env.PORT || 10000;
-
-// Self-ping mechanism to prevent Render from spinning down
-// Render free tier spins down after 15 minutes of inactivity
-const PING_INTERVAL = 10 * 60 * 1000; // 10 minutes
-const SERVICE_URL = process.env.SERVICE_URL || 'https://trade-republic-api.onrender.com';
-
-// Function to ping our own service
-function pingService() {
-  console.log(`[${new Date().toISOString()}] Pinging service to prevent spin-down: ${SERVICE_URL}`);
-  
-  const url = new URL(SERVICE_URL);
-  const options = {
-    hostname: url.hostname,
-    port: url.protocol === 'https:' ? 443 : 80,
-    path: '/api/ping',
-    method: 'GET',
-    headers: {
-      'x-api-key': process.env.API_KEY || 'a1b2c3d4e5f6g7h8i9j0'
-    }
-  };
-  
-  const req = (url.protocol === 'https:' ? https : http).request(options, (res) => {
-    let data = '';
-    res.on('data', (chunk) => data += chunk);
-    res.on('end', () => {
-      try {
-        console.log(`Ping response: ${res.statusCode} ${data}`);
-      } catch (e) {
-        console.log(`Ping response: ${res.statusCode}`);
-      }
-    });
-  });
-  
-  req.on('error', (error) => {
-    console.error(`Error pinging service: ${error.message}`);
-  });
-  
-  req.end();
-}
-
-// Start the ping interval
-console.log(`Setting up self-ping every ${PING_INTERVAL/60000} minutes to prevent spin-down`);
-setInterval(pingService, PING_INTERVAL);
 
 // Configure middleware
 app.use(bodyParser.json());
@@ -96,13 +51,8 @@ const limiter = rateLimit({
   message: { error: 'Too many requests, please try again later' }
 });
 
-// Apply API key auth to all routes except ping
-app.use((req, res, next) => {
-  if (req.path === '/api/ping') {
-    return next();
-  }
-  apiKeyAuth(req, res, next);
-});
+// Apply API key auth to all routes
+app.use(apiKeyAuth);
 
 // Load saved sessions if available
 try {
@@ -1088,16 +1038,6 @@ async function getPortfolioData(page, isRefresh = false) {
 
 // Define API routes
 
-// Special endpoint for self-pinging
-app.get('/api/ping', (req, res) => {
-  console.log(`[${new Date().toISOString()}] Received self-ping request`);
-  res.json({ 
-    status: 'ok', 
-    message: 'Service is running',
-    time: new Date().toISOString()
-  });
-});
-
 // DELETE - Close a session
 app.delete('/api/session/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
@@ -1469,12 +1409,10 @@ app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
     service: 'Trade Republic API',
-    version: '1.4.0',
+    version: '1.3.0',
     activeSessions: Object.keys(sessions).length,
     autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000,
-    autoPingMinutes: PING_INTERVAL / 60000,
-    persistence: true,
-    preventSpinDown: true
+    persistence: true
   });
 });
 
@@ -1643,14 +1581,10 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// Do an initial ping when the server starts
-setTimeout(pingService, 5000);
-
 // Start the server
 app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
   console.log(`Automatic session maintenance EVERY ${AUTO_REFRESH_INTERVAL/60000} MINUTES`);
-  console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
   console.log(`Sessions will be kept alive for 30 DAYS of inactivity`);
   console.log(`Session persistence ENABLED - Sessions will survive server restarts`);
 });
