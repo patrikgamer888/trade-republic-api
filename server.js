@@ -274,14 +274,14 @@ function forceSaveSession() {
 // Save sessions less frequently
 setInterval(saveSessionsToFile, SESSION_SAVE_INTERVAL);
 
-// SUPER AGGRESSIVE AUTOMATIC SESSION MAINTENANCE - EVERY 8 MINUTES
+// AUTOMATIC SESSION MAINTENANCE - EVERY 8 MINUTES
 // Changed from 4 to 8 minutes since PIN re-authentication happens about every 10 minutes
 const AUTO_REFRESH_INTERVAL = 8 * 60 * 1000; // 8 minutes
 
 // NEW: Special function to check for PIN re-authentication and enter PIN if needed
 async function checkAndEnterPINIfNeeded(page, pin) {
   try {
-    console.log("Checking if PIN re-authentication is needed...");
+    logDebug("Checking if PIN re-authentication is needed...");
     
     // Look for PIN input fieldset
     const hasPinInput = await page.evaluate(() => {
@@ -389,6 +389,8 @@ async function restoreSession(sessionId) {
       session.page = page;
       session.lastActivity = Date.now();
       session.needsRestore = false;
+      session.loginTimestamp = Date.now();
+      session.skipMaintenanceUntil = Date.now() + (15 * 60 * 1000); // Skip maintenance for 15 minutes after restore
       
       return true;
     } else if (loginResult.needs2FA) {
@@ -427,6 +429,12 @@ setInterval(async () => {
   
   for (const sessionId in sessions) {
     const session = sessions[sessionId];
+    
+    // Skip if session has a maintenance cooldown active
+    if (session.skipMaintenanceUntil && Date.now() < session.skipMaintenanceUntil) {
+      console.log(`Skipping maintenance for session ${sessionId} - in cooldown period (${Math.floor((session.skipMaintenanceUntil - Date.now()) / 60000)} minutes remaining)`);
+      continue;
+    }
     
     // Skip if session has queued user requests or is already busy
     if (sessionBusy[sessionId]) {
@@ -470,56 +478,22 @@ setInterval(async () => {
       if (pinEntered) {
         console.log(`Re-entered PIN for session ${sessionId}`);
         session.lastActivity = Date.now();
+        // Skip next maintenance cycle after PIN entry
+        session.skipMaintenanceUntil = Date.now() + (5 * 60 * 1000);
         sessionBusy[sessionId] = false;
         continue;
       }
       
-      // If no PIN entry was needed, check if still logged in
-      const isLoggedIn = await checkIfLoggedIn(page);
-      
-      if (!isLoggedIn) {
-        console.log(`Session ${sessionId} is not logged in, attempting to reconnect...`);
-        
-        // Try automatic re-login
-        const credentials = session.credentials;
-        
-        if (credentials && credentials.phoneNumber && credentials.pin) {
-          console.log("Attempting automatic re-login...");
-          
-          // Navigate back to portfolio
-          await page.goto("https://app.traderepublic.com/portfolio", { 
-            waitUntil: 'networkidle2',
-            timeout: 30000
-          });
-          
-          // Login again
-          const loginResult = await loginToTradeRepublic(page, credentials);
-          
-          if (loginResult.success) {
-            console.log(`✅ Automatic re-login successful for session ${sessionId}`);
-            session.lastActivity = Date.now();
-          } else {
-            console.log(`❌ Automatic re-login failed for session ${sessionId}`);
-            // Keep the session, we'll try again later
-          }
-        } else {
-          console.log(`No credentials for session ${sessionId}, can't reconnect`);
-        }
-      } else {
-        console.log(`Session ${sessionId} is still logged in`);
-        
-        // Rather than refreshing (which leads to logouts), just update the timestamp
-        // We now rely on the PIN re-entry approach instead
-        console.log(`Maintaining session ${sessionId} without page refresh`);
-        session.lastActivity = Date.now();
-      }
+      // If no PIN entry was needed, we're good - just update timestamp
+      console.log(`Session ${sessionId} is still logged in`);
+      session.lastActivity = Date.now();
+      sessionBusy[sessionId] = false;
       
     } catch (error) {
       console.log(`Error maintaining session ${sessionId}: ${error.message}`);
-    } finally {
       // Always release the session when maintenance is done
       sessionBusy[sessionId] = false;
-      
+    } finally {
       // Check if there are queued requests to process now
       if (sessionQueues[sessionId] && sessionQueues[sessionId].length > 0) {
         console.log(`Maintenance completed for ${sessionId}, processing ${sessionQueues[sessionId].length} queued requests`);
@@ -636,11 +610,42 @@ async function setupBrowser() {
   }
 }
 
-// Check if already logged in
+// Check if already logged in - IMPROVED VERSION
 async function checkIfLoggedIn(page) {
   try {
     logDebug("Checking login status...");
     
+    // First check if PIN re-authentication is visible (if yes, we're still logged in but need PIN)
+    const hasPinInput = await page.evaluate(() => {
+      return !!document.querySelector('fieldset#loginPin__input');
+    });
+    
+    if (hasPinInput) {
+      logDebug("Found PIN re-authentication prompt - session is still valid");
+      return true;
+    }
+    
+    // Check URL first (most reliable indicator)
+    const currentUrl = await page.url();
+    if (currentUrl.includes('/portfolio') || 
+        currentUrl.includes('/dashboard') || 
+        currentUrl.includes('/timeline') ||
+        currentUrl.includes('/profile')) {
+      logDebug("✅ Already logged in (based on URL)");
+      return true;
+    }
+    
+    // Check for login phone input - if present, we are NOT logged in
+    const hasPhoneInput = await page.evaluate(() => {
+      return !!document.querySelector('#loginPhoneNumber__input');
+    });
+    
+    if (hasPhoneInput) {
+      logDebug("❌ Found phone number input - not logged in");
+      return false;
+    }
+    
+    // Now check for logged in indicators
     const loggedInIndicators = [
       ".currencyStatus",
       ".portfolioInstrumentList",
@@ -669,16 +674,7 @@ async function checkIfLoggedIn(page) {
       }
     }
     
-    // Also check URL to see if we're in a logged-in section
-    const currentUrl = await page.url();
-    if (currentUrl.includes('/portfolio') || 
-        currentUrl.includes('/dashboard') || 
-        currentUrl.includes('/timeline')) {
-      logDebug("✅ Already logged in (based on URL)");
-      return true;
-    }
-    
-    logDebug("Not logged in yet");
+    logDebug("No login indicators found");
     return false;
   } catch (error) {
     console.log(`Error checking login status: ${error.message}`);
@@ -1088,9 +1084,18 @@ async function getPortfolioData(page, isRefresh = false) {
     console.log("\n📊 Fetching portfolio data...");
     
     // First check if PIN re-authentication is needed
-    const credentials = sessions[Object.keys(sessions).find(id => sessions[id].page === page)]?.credentials;
-    if (credentials && credentials.pin) {
-      await checkAndEnterPINIfNeeded(page, credentials.pin);
+    const sessionId = Object.keys(sessions).find(id => sessions[id].page === page);
+    const pin = sessionId ? sessions[sessionId].credentials.pin : null;
+    
+    if (pin) {
+      const pinEntered = await checkAndEnterPINIfNeeded(page, pin);
+      if (pinEntered) {
+        console.log("✅ Re-entered PIN during data fetch");
+        // Set cooldown after PIN entry
+        if (sessionId) {
+          sessions[sessionId].skipMaintenanceUntil = Date.now() + (5 * 60 * 1000);
+        }
+      }
     }
     
     // Get portfolio balance
@@ -1316,6 +1321,12 @@ async function getPortfolioData(page, isRefresh = false) {
       console.log(`Error getting cash balance: ${error.message}`);
     }
     
+    // Set maintenance cooldown for this session
+    if (sessionId) {
+      // Set a cooldown period after successful data fetch
+      sessions[sessionId].skipMaintenanceUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
+    }
+    
     return data;
   } catch (error) {
     console.log(`Error getting portfolio data: ${error.message}`);
@@ -1422,7 +1433,9 @@ app.post('/api/login', limiter, async (req, res) => {
       credentials: {
         phoneNumber,
         pin
-      }
+      },
+      loginTimestamp: Date.now(), // Add this to track when login happened
+      skipMaintenanceUntil: Date.now() + (15 * 60 * 1000) // Skip maintenance for 15 minutes after login
     };
     
     // Prepare handler function for the actual login process
@@ -1593,6 +1606,9 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
         if (isLoggedIn) {
           console.log("✅ Successfully logged in after 2FA");
           
+          // Set the maintenance cooldown after successful 2FA
+          sessions[sessionId].skipMaintenanceUntil = Date.now() + (15 * 60 * 1000);
+          
           // Get portfolio data
           const data = await getPortfolioData(page);
           
@@ -1666,54 +1682,12 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
         return res.status(500).json({ error: 'Session page not found' });
       }
       
-      // First check for PIN re-authentication
+      // Check if PIN re-authentication is needed
       const pinEntered = await checkAndEnterPINIfNeeded(page, sessions[sessionId].credentials.pin);
       
       if (pinEntered) {
         console.log("✅ Re-entered PIN during refresh");
-      }
-      
-      // Check if still logged in
-      const isLoggedIn = await checkIfLoggedIn(page);
-      
-      if (!isLoggedIn) {
-        console.log("❌ Session expired, need to login again");
-        
-        // Try automatic re-login
-        const credentials = sessions[sessionId].credentials;
-        
-        if (credentials && credentials.phoneNumber && credentials.pin) {
-          console.log("Attempting automatic re-login...");
-          
-          // Navigate back to portfolio
-          await page.goto("https://app.traderepublic.com/portfolio", { 
-            waitUntil: 'networkidle2',
-            timeout: 30000
-          });
-          
-          // Login again
-          const loginResult = await loginToTradeRepublic(page, credentials);
-          
-          if (loginResult.success) {
-            console.log("✅ Automatic re-login successful");
-          } else if (loginResult.needs2FA) {
-            return res.status(401).json({
-              success: false,
-              needs2FA: true,
-              error: 'Session expired and 2FA required for re-login'
-            });
-          } else {
-            return res.status(401).json({
-              success: false,
-              error: 'Session expired and automatic re-login failed'
-            });
-          }
-        } else {
-          return res.status(401).json({
-            success: false,
-            error: 'Session expired, please login again'
-          });
-        }
+        sessions[sessionId].skipMaintenanceUntil = Date.now() + (5 * 60 * 1000);
       }
       
       // Make sure we're on the portfolio page
@@ -1760,6 +1734,17 @@ app.get('/api/status', (req, res) => {
     }
   });
   
+  // Get cooldown information
+  const maintenanceCooldowns = {};
+  Object.keys(sessions).forEach(sessionId => {
+    if (sessions[sessionId].skipMaintenanceUntil && sessions[sessionId].skipMaintenanceUntil > Date.now()) {
+      const remainingMinutes = Math.floor((sessions[sessionId].skipMaintenanceUntil - Date.now()) / 60000);
+      if (remainingMinutes > 0) {
+        maintenanceCooldowns[sessionId] = `${remainingMinutes} minutes`;
+      }
+    }
+  });
+  
   res.json({ 
     status: 'ok',
     service: 'Trade Republic API',
@@ -1768,6 +1753,7 @@ app.get('/api/status', (req, res) => {
     autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000,
     autoPingMinutes: PING_INTERVAL / 60000,
     queuedRequests: queueSizes,
+    maintenanceCooldowns,
     persistence: true,
     preventSpinDown: true,
     maintenanceStrategy: "PIN re-authentication"
@@ -1802,14 +1788,16 @@ app.post('/api/portfolio', limiter, async (req, res) => {
     
     console.log(`✅ Browser launched for session: ${sessionId}`);
     
-    // Create session
+    // Create session with maintenance cooldown
     sessions[sessionId] = {
       browser,
       lastActivity: Date.now(),
       credentials: {
         phoneNumber,
         pin
-      }
+      },
+      loginTimestamp: Date.now(),
+      skipMaintenanceUntil: Date.now() + (15 * 60 * 1000) // Skip maintenance for 15 minutes after login
     };
     
     // Define handler for portfolio login
