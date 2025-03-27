@@ -274,8 +274,72 @@ function forceSaveSession() {
 // Save sessions less frequently
 setInterval(saveSessionsToFile, SESSION_SAVE_INTERVAL);
 
-// SUPER AGGRESSIVE AUTOMATIC SESSION MAINTENANCE - EVERY 4 MINUTES
-const AUTO_REFRESH_INTERVAL = 4 * 60 * 1000; // 4 minutes
+// SUPER AGGRESSIVE AUTOMATIC SESSION MAINTENANCE - EVERY 8 MINUTES
+// Changed from 4 to 8 minutes since PIN re-authentication happens about every 10 minutes
+const AUTO_REFRESH_INTERVAL = 8 * 60 * 1000; // 8 minutes
+
+// NEW: Special function to check for PIN re-authentication and enter PIN if needed
+async function checkAndEnterPINIfNeeded(page, pin) {
+  try {
+    console.log("Checking if PIN re-authentication is needed...");
+    
+    // Look for PIN input fieldset
+    const hasPinInput = await page.evaluate(() => {
+      return !!document.querySelector('fieldset#loginPin__input');
+    });
+    
+    if (!hasPinInput) {
+      logDebug("No PIN re-authentication needed");
+      return false;
+    }
+    
+    console.log("📱 PIN re-authentication required, entering PIN...");
+    
+    // Find PIN input fields
+    let pinInputs = await page.$$('fieldset#loginPin__input input.codeInput__character[type="password"]');
+    
+    // If not found with specific class, try more generic selector
+    if (!pinInputs || pinInputs.length === 0) {
+      logDebug("Trying alternative PIN selector...");
+      pinInputs = await page.$$('#loginPin__input input[type="password"]');
+    }
+    
+    // Last resort - try any password input
+    if (!pinInputs || pinInputs.length === 0) {
+      logDebug("Trying any password input as last resort...");
+      pinInputs = await page.$$('input[type="password"]');
+    }
+    
+    logDebug(`Found ${pinInputs.length} PIN input fields`);
+    
+    if (pinInputs.length === 0) {
+      console.log("❌ No PIN input fields found despite PIN fieldset being visible");
+      return false;
+    }
+    
+    // Enter PIN digits
+    if (pinInputs.length === 1) {
+      // If only one input field for all digits
+      await pinInputs[0].type(pin, {delay: 0});
+    } else {
+      // Enter each digit
+      for (let i = 0; i < pin.length && i < pinInputs.length; i++) {
+        await pinInputs[i].click();
+        await pinInputs[i].type(pin[i], {delay: 0});
+      }
+    }
+    
+    console.log("✅ PIN re-entered successfully");
+    
+    // Wait a moment for PIN processing
+    await sleep(1500);
+    
+    return true;
+  } catch (error) {
+    console.log(`Error checking/entering PIN: ${error.message}`);
+    return false;
+  }
+}
 
 // Restore a session
 async function restoreSession(sessionId) {
@@ -356,7 +420,7 @@ async function restoreSession(sessionId) {
   }
 }
 
-// Start automatic session refresh - IMPROVED VERSION WITH QUEUE AWARENESS
+// Start automatic session maintenance - IMPROVED VERSION WITH PIN CHECKING
 console.log(`Setting up automatic session maintenance every ${AUTO_REFRESH_INTERVAL/60000} minutes`);
 setInterval(async () => {
   console.log(`[${new Date().toISOString()}] Running automatic session maintenance...`);
@@ -389,7 +453,7 @@ setInterval(async () => {
         }
       }
       
-      console.log(`Refreshing session ${sessionId}...`);
+      console.log(`Running maintenance for session ${sessionId}...`);
       
       // Get the page from the session
       const page = session.page;
@@ -400,7 +464,17 @@ setInterval(async () => {
         continue;
       }
       
-      // Check if still logged in
+      // First, check if we need to re-enter PIN (new approach)
+      const pinEntered = await checkAndEnterPINIfNeeded(page, session.credentials.pin);
+      
+      if (pinEntered) {
+        console.log(`Re-entered PIN for session ${sessionId}`);
+        session.lastActivity = Date.now();
+        sessionBusy[sessionId] = false;
+        continue;
+      }
+      
+      // If no PIN entry was needed, check if still logged in
       const isLoggedIn = await checkIfLoggedIn(page);
       
       if (!isLoggedIn) {
@@ -434,14 +508,10 @@ setInterval(async () => {
       } else {
         console.log(`Session ${sessionId} is still logged in`);
         
-        // Just refresh the page to keep the session alive
-        try {
-          await page.reload({ waitUntil: 'networkidle2' });
-          console.log(`Refreshed page for session ${sessionId}`);
-          session.lastActivity = Date.now();
-        } catch (refreshError) {
-          console.log(`Error refreshing page for session ${sessionId}: ${refreshError.message}`);
-        }
+        // Rather than refreshing (which leads to logouts), just update the timestamp
+        // We now rely on the PIN re-entry approach instead
+        console.log(`Maintaining session ${sessionId} without page refresh`);
+        session.lastActivity = Date.now();
       }
       
     } catch (error) {
@@ -862,6 +932,13 @@ async function loginToTradeRepublic(page, credentials) {
       return { success: true };
     }
     
+    // Check if PIN re-authentication is needed
+    const pinEntered = await checkAndEnterPINIfNeeded(page, pin);
+    if (pinEntered) {
+      console.log("✅ Completed PIN re-authentication");
+      return { success: true };
+    }
+    
     // Handle cookie consent if present
     await handleCookieConsent(page);
     
@@ -1009,6 +1086,12 @@ async function getPortfolioData(page, isRefresh = false) {
   
   try {
     console.log("\n📊 Fetching portfolio data...");
+    
+    // First check if PIN re-authentication is needed
+    const credentials = sessions[Object.keys(sessions).find(id => sessions[id].page === page)]?.credentials;
+    if (credentials && credentials.pin) {
+      await checkAndEnterPINIfNeeded(page, credentials.pin);
+    }
     
     // Get portfolio balance
     try {
@@ -1583,6 +1666,13 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
         return res.status(500).json({ error: 'Session page not found' });
       }
       
+      // First check for PIN re-authentication
+      const pinEntered = await checkAndEnterPINIfNeeded(page, sessions[sessionId].credentials.pin);
+      
+      if (pinEntered) {
+        console.log("✅ Re-entered PIN during refresh");
+      }
+      
       // Check if still logged in
       const isLoggedIn = await checkIfLoggedIn(page);
       
@@ -1626,9 +1716,6 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
         }
       }
       
-      // Refresh portfolio data
-      console.log("Refreshing portfolio data...");
-      
       // Make sure we're on the portfolio page
       const currentUrl = await page.url();
       if (!currentUrl.includes('/portfolio')) {
@@ -1638,13 +1725,9 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
           timeout: 15000
         });
         await sleep(2000); // Wait for page to load
-      } else {
-        // Just refresh the current page
-        await page.reload({ waitUntil: 'networkidle2' });
-        await sleep(2000); // Wait for page to load
       }
       
-      // Get updated portfolio data
+      // Get updated portfolio data without page refresh
       const data = await getPortfolioData(page, true);
       
       // Return success with data
@@ -1680,13 +1763,14 @@ app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
     service: 'Trade Republic API',
-    version: '1.5.0', // Updated version
+    version: '1.6.0', // Updated version with PIN re-authentication
     activeSessions: Object.keys(sessions).length,
     autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000,
     autoPingMinutes: PING_INTERVAL / 60000,
     queuedRequests: queueSizes,
     persistence: true,
-    preventSpinDown: true
+    preventSpinDown: true,
+    maintenanceStrategy: "PIN re-authentication"
   });
 });
 
@@ -1892,5 +1976,5 @@ app.listen(PORT, () => {
   console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
   console.log(`Sessions will be kept alive for 30 DAYS of inactivity`);
   console.log(`Session persistence ENABLED - Sessions will survive server restarts`);
-  console.log(`Version 1.5.0 - Added request queueing to prevent conflicts`);
+  console.log(`Version 1.6.0 - New session maintenance using PIN re-authentication`);
 });
