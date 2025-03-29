@@ -274,72 +274,9 @@ function forceSaveSession() {
 // Save sessions less frequently
 setInterval(saveSessionsToFile, SESSION_SAVE_INTERVAL);
 
-// AUTOMATIC SESSION MAINTENANCE - EVERY 8 MINUTES
-// Changed from 4 to 8 minutes since PIN re-authentication happens about every 10 minutes
-const AUTO_REFRESH_INTERVAL = 8 * 60 * 1000; // 8 minutes
-
-// NEW: Special function to check for PIN re-authentication and enter PIN if needed
-async function checkAndEnterPINIfNeeded(page, pin) {
-  try {
-    logDebug("Checking if PIN re-authentication is needed...");
-    
-    // Look for PIN input fieldset
-    const hasPinInput = await page.evaluate(() => {
-      return !!document.querySelector('fieldset#loginPin__input');
-    });
-    
-    if (!hasPinInput) {
-      logDebug("No PIN re-authentication needed");
-      return false;
-    }
-    
-    console.log("📱 PIN re-authentication required, entering PIN...");
-    
-    // Find PIN input fields
-    let pinInputs = await page.$$('fieldset#loginPin__input input.codeInput__character[type="password"]');
-    
-    // If not found with specific class, try more generic selector
-    if (!pinInputs || pinInputs.length === 0) {
-      logDebug("Trying alternative PIN selector...");
-      pinInputs = await page.$$('#loginPin__input input[type="password"]');
-    }
-    
-    // Last resort - try any password input
-    if (!pinInputs || pinInputs.length === 0) {
-      logDebug("Trying any password input as last resort...");
-      pinInputs = await page.$$('input[type="password"]');
-    }
-    
-    logDebug(`Found ${pinInputs.length} PIN input fields`);
-    
-    if (pinInputs.length === 0) {
-      console.log("❌ No PIN input fields found despite PIN fieldset being visible");
-      return false;
-    }
-    
-    // Enter PIN digits
-    if (pinInputs.length === 1) {
-      // If only one input field for all digits
-      await pinInputs[0].type(pin, {delay: 0});
-    } else {
-      // Enter each digit
-      for (let i = 0; i < pin.length && i < pinInputs.length; i++) {
-        await pinInputs[i].click();
-        await pinInputs[i].type(pin[i], {delay: 0});
-      }
-    }
-    
-    console.log("✅ PIN re-entered successfully");
-    
-    // Wait a moment for PIN processing
-    await sleep(1500);
-    
-    return true;
-  } catch (error) {
-    console.log(`Error checking/entering PIN: ${error.message}`);
-    return false;
-  }
-}
+// SUPER AGGRESSIVE AUTOMATIC PAGE REFRESH - EVERY 9 MINUTES
+// This is faster than TR's PIN prompt (approx. 10 minutes)
+const AUTO_REFRESH_INTERVAL = 9 * 60 * 1000; // 9 minutes
 
 // Restore a session
 async function restoreSession(sessionId) {
@@ -390,7 +327,7 @@ async function restoreSession(sessionId) {
       session.lastActivity = Date.now();
       session.needsRestore = false;
       session.loginTimestamp = Date.now();
-      session.skipMaintenanceUntil = Date.now() + (15 * 60 * 1000); // Skip maintenance for 15 minutes after restore
+      session.skipMaintenanceUntil = Date.now() + (3 * 60 * 1000); // Skip maintenance for 3 minutes after restore
       
       return true;
     } else if (loginResult.needs2FA) {
@@ -422,28 +359,28 @@ async function restoreSession(sessionId) {
   }
 }
 
-// Start automatic session maintenance - IMPROVED VERSION WITH PIN CHECKING
-console.log(`Setting up automatic session maintenance every ${AUTO_REFRESH_INTERVAL/60000} minutes`);
+// Start automatic session refresh - SIMPLIFIED TO JUST PAGE REFRESH EVERY 9 MINUTES
+console.log(`Setting up automatic page refresh every ${AUTO_REFRESH_INTERVAL/60000} minutes to prevent PIN requests`);
 setInterval(async () => {
-  console.log(`[${new Date().toISOString()}] Running automatic session maintenance...`);
+  console.log(`[${new Date().toISOString()}] Running automatic page refresh...`);
   
   for (const sessionId in sessions) {
     const session = sessions[sessionId];
     
     // Skip if session has a maintenance cooldown active
     if (session.skipMaintenanceUntil && Date.now() < session.skipMaintenanceUntil) {
-      console.log(`Skipping maintenance for session ${sessionId} - in cooldown period (${Math.floor((session.skipMaintenanceUntil - Date.now()) / 60000)} minutes remaining)`);
+      console.log(`Skipping refresh for session ${sessionId} - in cooldown period (${Math.floor((session.skipMaintenanceUntil - Date.now()) / 60000)} minutes remaining)`);
       continue;
     }
     
     // Skip if session has queued user requests or is already busy
     if (sessionBusy[sessionId]) {
-      console.log(`Skipping maintenance for session ${sessionId} - session is busy`);
+      console.log(`Skipping refresh for session ${sessionId} - session is busy`);
       continue;
     }
     
     if (sessionQueues[sessionId] && sessionQueues[sessionId].length > 0) {
-      console.log(`Skipping maintenance for session ${sessionId} - has ${sessionQueues[sessionId].length} queued requests`);
+      console.log(`Skipping refresh for session ${sessionId} - has ${sessionQueues[sessionId].length} queued requests`);
       continue;
     }
     
@@ -461,7 +398,7 @@ setInterval(async () => {
         }
       }
       
-      console.log(`Running maintenance for session ${sessionId}...`);
+      console.log(`Refreshing page for session ${sessionId}...`);
       
       // Get the page from the session
       const page = session.page;
@@ -472,28 +409,50 @@ setInterval(async () => {
         continue;
       }
       
-      // First, check if we need to re-enter PIN (new approach)
-      const pinEntered = await checkAndEnterPINIfNeeded(page, session.credentials.pin);
-      
-      if (pinEntered) {
-        console.log(`Re-entered PIN for session ${sessionId}`);
+      try {
+        // Check current URL
+        const currentUrl = await page.url();
+        
+        // If we're not on portfolio page, navigate back
+        if (!currentUrl.includes('/portfolio')) {
+          console.log(`Session ${sessionId} is on ${currentUrl}, navigating back to portfolio...`);
+          await page.goto("https://app.traderepublic.com/portfolio", { 
+            waitUntil: 'networkidle2',
+            timeout: 30000
+          });
+        } else {
+          // Just refresh the current page
+          await page.reload({ 
+            waitUntil: 'networkidle2',
+            timeout: 30000 
+          });
+        }
+        
+        console.log(`✅ Page refreshed for session ${sessionId}`);
         session.lastActivity = Date.now();
-        // Skip next maintenance cycle after PIN entry
-        session.skipMaintenanceUntil = Date.now() + (5 * 60 * 1000);
-        sessionBusy[sessionId] = false;
-        continue;
+        
+        // Set a brief cooldown after refresh
+        session.skipMaintenanceUntil = Date.now() + (1 * 60 * 1000); // 1 minute cooldown
+      } catch (refreshError) {
+        console.log(`Error refreshing page for session ${sessionId}: ${refreshError.message}`);
+        
+        // Try to navigate to portfolio as a fallback
+        try {
+          await page.goto("https://app.traderepublic.com/portfolio", { 
+            waitUntil: 'networkidle2',
+            timeout: 30000
+          });
+          console.log(`✅ Navigated to portfolio after refresh error for session ${sessionId}`);
+        } catch (navError) {
+          console.log(`Failed to navigate to portfolio: ${navError.message}`);
+        }
       }
-      
-      // If no PIN entry was needed, we're good - just update timestamp
-      console.log(`Session ${sessionId} is still logged in`);
-      session.lastActivity = Date.now();
-      sessionBusy[sessionId] = false;
-      
     } catch (error) {
       console.log(`Error maintaining session ${sessionId}: ${error.message}`);
+    } finally {
       // Always release the session when maintenance is done
       sessionBusy[sessionId] = false;
-    } finally {
+      
       // Check if there are queued requests to process now
       if (sessionQueues[sessionId] && sessionQueues[sessionId].length > 0) {
         console.log(`Maintenance completed for ${sessionId}, processing ${sessionQueues[sessionId].length} queued requests`);
@@ -502,7 +461,7 @@ setInterval(async () => {
     }
   }
   
-  console.log(`[${new Date().toISOString()}] Session maintenance completed`);
+  console.log(`[${new Date().toISOString()}] Page refresh completed`);
   
   // Save sessions to file after maintenance
   saveSessionsToFile();
@@ -610,20 +569,10 @@ async function setupBrowser() {
   }
 }
 
-// Check if already logged in - IMPROVED VERSION
+// Check if already logged in - SIMPLIFIED VERSION
 async function checkIfLoggedIn(page) {
   try {
     logDebug("Checking login status...");
-    
-    // First check if PIN re-authentication is visible (if yes, we're still logged in but need PIN)
-    const hasPinInput = await page.evaluate(() => {
-      return !!document.querySelector('fieldset#loginPin__input');
-    });
-    
-    if (hasPinInput) {
-      logDebug("Found PIN re-authentication prompt - session is still valid");
-      return true;
-    }
     
     // Check URL first (most reliable indicator)
     const currentUrl = await page.url();
@@ -928,13 +877,6 @@ async function loginToTradeRepublic(page, credentials) {
       return { success: true };
     }
     
-    // Check if PIN re-authentication is needed
-    const pinEntered = await checkAndEnterPINIfNeeded(page, pin);
-    if (pinEntered) {
-      console.log("✅ Completed PIN re-authentication");
-      return { success: true };
-    }
-    
     // Handle cookie consent if present
     await handleCookieConsent(page);
     
@@ -1082,21 +1024,6 @@ async function getPortfolioData(page, isRefresh = false) {
   
   try {
     console.log("\n📊 Fetching portfolio data...");
-    
-    // First check if PIN re-authentication is needed
-    const sessionId = Object.keys(sessions).find(id => sessions[id].page === page);
-    const pin = sessionId ? sessions[sessionId].credentials.pin : null;
-    
-    if (pin) {
-      const pinEntered = await checkAndEnterPINIfNeeded(page, pin);
-      if (pinEntered) {
-        console.log("✅ Re-entered PIN during data fetch");
-        // Set cooldown after PIN entry
-        if (sessionId) {
-          sessions[sessionId].skipMaintenanceUntil = Date.now() + (5 * 60 * 1000);
-        }
-      }
-    }
     
     // Get portfolio balance
     try {
@@ -1321,10 +1248,15 @@ async function getPortfolioData(page, isRefresh = false) {
       console.log(`Error getting cash balance: ${error.message}`);
     }
     
-    // Set maintenance cooldown for this session
-    if (sessionId) {
-      // Set a cooldown period after successful data fetch
-      sessions[sessionId].skipMaintenanceUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
+    // Find which session this page belongs to and set cooldown
+    try {
+      const sessionId = Object.keys(sessions).find(id => sessions[id].page === page);
+      if (sessionId) {
+        // Set a cooldown period after successful data fetch
+        sessions[sessionId].skipMaintenanceUntil = Date.now() + (3 * 60 * 1000); // 3 minutes
+      }
+    } catch (error) {
+      console.log("Error setting maintenance cooldown");
     }
     
     return data;
@@ -1435,7 +1367,7 @@ app.post('/api/login', limiter, async (req, res) => {
         pin
       },
       loginTimestamp: Date.now(), // Add this to track when login happened
-      skipMaintenanceUntil: Date.now() + (15 * 60 * 1000) // Skip maintenance for 15 minutes after login
+      skipMaintenanceUntil: Date.now() + (5 * 60 * 1000) // Skip maintenance for 5 minutes after login
     };
     
     // Prepare handler function for the actual login process
@@ -1607,7 +1539,7 @@ app.post('/api/submit-2fa', limiter, async (req, res) => {
           console.log("✅ Successfully logged in after 2FA");
           
           // Set the maintenance cooldown after successful 2FA
-          sessions[sessionId].skipMaintenanceUntil = Date.now() + (15 * 60 * 1000);
+          sessions[sessionId].skipMaintenanceUntil = Date.now() + (5 * 60 * 1000);
           
           // Get portfolio data
           const data = await getPortfolioData(page);
@@ -1682,14 +1614,6 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
         return res.status(500).json({ error: 'Session page not found' });
       }
       
-      // Check if PIN re-authentication is needed
-      const pinEntered = await checkAndEnterPINIfNeeded(page, sessions[sessionId].credentials.pin);
-      
-      if (pinEntered) {
-        console.log("✅ Re-entered PIN during refresh");
-        sessions[sessionId].skipMaintenanceUntil = Date.now() + (5 * 60 * 1000);
-      }
-      
       // Make sure we're on the portfolio page
       const currentUrl = await page.url();
       if (!currentUrl.includes('/portfolio')) {
@@ -1699,10 +1623,17 @@ app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
           timeout: 15000
         });
         await sleep(2000); // Wait for page to load
+      } else {
+        // Just refresh the current page
+        await page.reload({ waitUntil: 'networkidle2' });
+        await sleep(2000); // Wait for page to load
       }
       
-      // Get updated portfolio data without page refresh
+      // Get updated portfolio data
       const data = await getPortfolioData(page, true);
+      
+      // Set maintenance cooldown
+      sessions[sessionId].skipMaintenanceUntil = Date.now() + (3 * 60 * 1000);
       
       // Return success with data
       return res.json({
@@ -1748,7 +1679,7 @@ app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
     service: 'Trade Republic API',
-    version: '1.6.0', // Updated version with PIN re-authentication
+    version: '1.7.0', // Updated version with 9-minute refresh
     activeSessions: Object.keys(sessions).length,
     autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000,
     autoPingMinutes: PING_INTERVAL / 60000,
@@ -1756,7 +1687,7 @@ app.get('/api/status', (req, res) => {
     maintenanceCooldowns,
     persistence: true,
     preventSpinDown: true,
-    maintenanceStrategy: "PIN re-authentication"
+    maintenanceStrategy: "Pre-emptive page refresh (every 9 minutes)"
   });
 });
 
@@ -1797,7 +1728,7 @@ app.post('/api/portfolio', limiter, async (req, res) => {
         pin
       },
       loginTimestamp: Date.now(),
-      skipMaintenanceUntil: Date.now() + (15 * 60 * 1000) // Skip maintenance for 15 minutes after login
+      skipMaintenanceUntil: Date.now() + (5 * 60 * 1000) // Skip maintenance for 5 minutes after login
     };
     
     // Define handler for portfolio login
@@ -1960,9 +1891,9 @@ setTimeout(pingService, 5000);
 // Start the server
 app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
-  console.log(`Automatic session maintenance EVERY ${AUTO_REFRESH_INTERVAL/60000} MINUTES`);
+  console.log(`Automatic page refresh EVERY ${AUTO_REFRESH_INTERVAL/60000} MINUTES to prevent PIN prompts`);
   console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
   console.log(`Sessions will be kept alive for 30 DAYS of inactivity`);
   console.log(`Session persistence ENABLED - Sessions will survive server restarts`);
-  console.log(`Version 1.6.0 - New session maintenance using PIN re-authentication`);
+  console.log(`Version 1.7.0 - Using page refresh every 9 minutes to avoid PIN prompts`);
 });
