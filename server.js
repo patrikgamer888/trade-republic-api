@@ -4,8 +4,6 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
-const path = require('path');
 const https = require('https');
 const http = require('http');
 
@@ -19,13 +17,11 @@ const PORT = process.env.PORT || 10000;
 // Debug logging control
 const DEBUG_LOGGING = process.env.DEBUG_LOGGING === 'true';
 
-// Queue system for managing session access
-const sessionBusy = {};       // Tracks if a session is busy with maintenance or requests
-const sessionQueues = {};     // Queues for each session
+// Queue system for managing requests
+const requestQueue = [];
 const MAX_QUEUE_TIME = 30000; // Maximum wait time (30 seconds)
-
-// Session tracking
-let lastSessionsHash = '';  // For efficient session saving
+const MAX_CONCURRENT_BROWSERS = 2; // Maximum number of concurrent browser instances
+let activeBrowsers = 0; // Track number of active browser instances
 
 // Function to log debug messages
 function logDebug(message) {
@@ -83,19 +79,6 @@ app.use(bodyParser.json());
 // IMPORTANT: Fix for Render's proxy environment
 app.set('trust proxy', 1);
 
-// Session storage
-const SESSIONS_DIR = path.join(__dirname, 'sessions');
-const SESSIONS_FILE = path.join(SESSIONS_DIR, 'sessions.json');
-const SESSION_SAVE_INTERVAL = 10 * 60 * 1000; // 10 minutes
-
-// Create sessions directory if it doesn't exist
-if (!fs.existsSync(SESSIONS_DIR)) {
-  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-}
-
-// In-memory sessions object
-const sessions = {};
-
 // API key middleware
 const apiKeyAuth = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
@@ -123,34 +106,8 @@ app.use((req, res, next) => {
   apiKeyAuth(req, res, next);
 });
 
-// Load saved sessions if available
-try {
-  if (fs.existsSync(SESSIONS_FILE)) {
-    const savedSessionsData = fs.readFileSync(SESSIONS_FILE, 'utf8');
-    const savedSessions = JSON.parse(savedSessionsData);
-    console.log(`Found ${Object.keys(savedSessions).length} saved sessions`);
-    
-    // Store session metadata for restoration
-    Object.keys(savedSessions).forEach(sessionId => {
-      sessions[sessionId] = {
-        ...savedSessions[sessionId],
-        browser: null,
-        page: null,
-        needsRestore: true
-      };
-    });
-  }
-} catch (error) {
-  console.error(`Error loading saved sessions: ${error.message}`);
-}
-
 // Queue management functions
-function queueSessionRequest(sessionId, handlerFunction, res) {
-  // Initialize queue if it doesn't exist
-  if (!sessionQueues[sessionId]) {
-    sessionQueues[sessionId] = [];
-  }
-  
+function queueRequest(handlerFunction, res) {
   // Add request to queue
   const queuedRequest = {
     handler: handlerFunction,
@@ -159,36 +116,26 @@ function queueSessionRequest(sessionId, handlerFunction, res) {
     res
   };
   
-  sessionQueues[sessionId].push(queuedRequest);
+  requestQueue.push(queuedRequest);
   
-  console.log(`Request queued for session ${sessionId}. Queue length: ${sessionQueues[sessionId].length}`);
+  console.log(`Request queued. Queue length: ${requestQueue.length}`);
   
-  // If this is the first request and session is not busy, process it immediately
-  if (sessionQueues[sessionId].length === 1 && !sessionBusy[sessionId]) {
-    processNextQueuedRequest(sessionId);
-  }
+  // Process queue if possible
+  processQueue();
 }
 
-async function processNextQueuedRequest(sessionId) {
-  // If queue is empty or session doesn't exist, nothing to do
-  if (!sessionQueues[sessionId] || sessionQueues[sessionId].length === 0 || !sessions[sessionId]) {
-    return;
-  }
-  
-  // If session is busy, wait for it to become available
-  if (sessionBusy[sessionId]) {
-    console.log(`Session ${sessionId} is busy, will check again in 1 second...`);
-    setTimeout(() => processNextQueuedRequest(sessionId), 1000);
+async function processQueue() {
+  // If queue is empty or max concurrent browsers reached, nothing to do
+  if (requestQueue.length === 0 || activeBrowsers >= MAX_CONCURRENT_BROWSERS) {
     return;
   }
   
   // Get next request from queue
-  const request = sessionQueues[sessionId][0];
+  const request = requestQueue.shift();
   
   // Check if request has expired
   if (Date.now() > request.expiresAt) {
-    console.log(`Request for session ${sessionId} expired in queue.`);
-    sessionQueues[sessionId].shift(); // Remove expired request
+    console.log(`Request expired in queue.`);
     
     // Send timeout response
     if (!request.res.headersSent) {
@@ -199,22 +146,19 @@ async function processNextQueuedRequest(sessionId) {
     }
     
     // Process next request
-    processNextQueuedRequest(sessionId);
+    processQueue();
     return;
   }
   
-  // Mark session as busy
-  sessionBusy[sessionId] = true;
+  // Increment active browser count
+  activeBrowsers++;
   
   try {
-    // Remove request from queue
-    sessionQueues[sessionId].shift();
-    
     // Process the request
-    console.log(`Processing queued request for session ${sessionId}. Wait time: ${(Date.now() - request.queuedAt)/1000}s`);
+    console.log(`Processing queued request. Wait time: ${(Date.now() - request.queuedAt)/1000}s`);
     await request.handler();
   } catch (error) {
-    console.error(`Error processing queued request for session ${sessionId}: ${error.message}`);
+    console.error(`Error processing queued request: ${error.message}`);
     
     // Handle response error if not already sent
     if (!request.res.headersSent) {
@@ -224,321 +168,13 @@ async function processNextQueuedRequest(sessionId) {
       });
     }
   } finally {
-    // Mark session as available
-    sessionBusy[sessionId] = false;
+    // Decrement active browser count
+    activeBrowsers--;
     
     // Process next request if any
-    if (sessionQueues[sessionId] && sessionQueues[sessionId].length > 0) {
-      processNextQueuedRequest(sessionId);
-    }
+    processQueue();
   }
 }
-
-// Save sessions to file - improved version
-function saveSessionsToFile() {
-  try {
-    // Create a version of sessions without browser/page objects
-    const sessionsToSave = {};
-    
-    Object.keys(sessions).forEach(sessionId => {
-      const { browser, page, ...sessionData } = sessions[sessionId];
-      sessionsToSave[sessionId] = sessionData;
-    });
-    
-    // Check if sessions have actually changed before saving
-    const currentHash = JSON.stringify(sessionsToSave);
-    if (currentHash === lastSessionsHash) {
-      // Sessions haven't changed, no need to write to disk
-      return;
-    }
-    
-    // Save updated sessions and update hash
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessionsToSave, null, 2));
-    lastSessionsHash = currentHash;
-    
-    // Only log when debugging is enabled
-    if (DEBUG_LOGGING) {
-      console.log(`Saved ${Object.keys(sessionsToSave).length} sessions to ${SESSIONS_FILE}`);
-    }
-  } catch (error) {
-    console.error(`Error saving sessions: ${error.message}`);
-  }
-}
-
-// Force save sessions
-function forceSaveSession() {
-  logDebug("Forcing session save");
-  saveSessionsToFile();
-}
-
-// Save sessions less frequently
-setInterval(saveSessionsToFile, SESSION_SAVE_INTERVAL);
-
-// AUTOMATIC PAGE REFRESH WITH SITE NAVIGATION - EVERY 8 MINUTES
-const AUTO_REFRESH_INTERVAL = 8 * 60 * 1000; // 8 minutes
-
-// Restore a session
-async function restoreSession(sessionId) {
-  try {
-    const session = sessions[sessionId];
-    
-    if (!session) {
-      console.log(`Session ${sessionId} not found, cannot restore`);
-      return false;
-    }
-    
-    if (!session.credentials || !session.credentials.phoneNumber || !session.credentials.pin) {
-      console.log(`Session ${sessionId} has no credentials, cannot restore`);
-      return false;
-    }
-    
-    console.log(`Restoring session ${sessionId}...`);
-    
-    // Set up new browser
-    const browser = await setupBrowser();
-    if (!browser) {
-      console.log(`Failed to create browser for session ${sessionId}`);
-      return false;
-    }
-    
-    // Create new page
-    const pages = await browser.pages();
-    const page = pages[0];
-    
-    // Set realistic user agent
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // Navigate to Trade Republic
-    await page.goto("https://app.traderepublic.com/portfolio", { 
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
-    
-    // Login
-    const loginResult = await loginToTradeRepublic(page, session.credentials);
-    
-    if (loginResult.success) {
-      console.log(`✅ Successfully restored session ${sessionId}`);
-      
-      // Update session with new browser and page
-      session.browser = browser;
-      session.page = page;
-      session.lastActivity = Date.now();
-      session.needsRestore = false;
-      
-      return true;
-    } else if (loginResult.needs2FA) {
-      console.log(`❌ Cannot automatically restore session ${sessionId} - 2FA required`);
-      
-      // Close browser
-      try {
-        await browser.close();
-      } catch (error) {
-        console.log(`Error closing browser: ${error.message}`);
-      }
-      
-      return false;
-    } else {
-      console.log(`❌ Failed to restore session ${sessionId}: ${loginResult.error}`);
-      
-      // Close browser
-      try {
-        await browser.close();
-      } catch (error) {
-        console.log(`Error closing browser: ${error.message}`);
-      }
-      
-      return false;
-    }
-  } catch (error) {
-    console.log(`Error restoring session ${sessionId}: ${error.message}`);
-    return false;
-  }
-}
-
-// Function to simulate user activity by navigating through the app
-async function simulateUserActivity(page) {
-  try {
-    console.log("Simulating user activity with page navigation...");
-    
-    // Check if we are already on the portfolio page
-    const currentUrl = await page.url();
-    if (!currentUrl.includes('/portfolio')) {
-      console.log("Not on portfolio page, navigating there first...");
-      await page.goto("https://app.traderepublic.com/portfolio", { 
-        waitUntil: 'networkidle2',
-        timeout: 15000
-      });
-      await sleep(1000);
-    }
-    
-    // Navigate to transactions page
-    console.log("Navigating to transactions page...");
-    const transactionsLink = await page.$('a.navigationItem__link[href="/profile/transactions"]');
-    
-    if (transactionsLink) {
-      await transactionsLink.click();
-      console.log("Clicked transactions link");
-      await sleep(2000); // Wait for transactions page to load
-    } else {
-      console.log("Transactions link not found, trying direct navigation...");
-      await page.goto("https://app.traderepublic.com/profile/transactions", {
-        waitUntil: 'networkidle2',
-        timeout: 15000
-      });
-      await sleep(2000);
-    }
-    
-    // Navigate back to portfolio page
-    console.log("Navigating back to portfolio page...");
-    await page.goto("https://app.traderepublic.com/portfolio", {
-      waitUntil: 'networkidle2',
-      timeout: 15000
-    });
-    await sleep(1000);
-    
-    console.log("User activity simulation completed");
-    return true;
-  } catch (error) {
-    console.log(`Error simulating user activity: ${error.message}`);
-    return false;
-  }
-}
-
-// Start automatic session refresh
-console.log(`Setting up automatic page refresh with navigation every ${AUTO_REFRESH_INTERVAL/60000} minutes to prevent session timeouts`);
-setInterval(async () => {
-  console.log(`[${new Date().toISOString()}] Running automatic page refresh with navigation...`);
-  
-  for (const sessionId in sessions) {
-    const session = sessions[sessionId];
-    
-    // Skip if session has queued user requests or is already busy
-    if (sessionBusy[sessionId]) {
-      console.log(`Skipping refresh for session ${sessionId} - session is busy`);
-      continue;
-    }
-    
-    if (sessionQueues[sessionId] && sessionQueues[sessionId].length > 0) {
-      console.log(`Skipping refresh for session ${sessionId} - has ${sessionQueues[sessionId].length} queued requests`);
-      continue;
-    }
-    
-    // Mark session as busy with maintenance
-    sessionBusy[sessionId] = true;
-    
-    try {
-      // Check if session needs to be restored (after server restart)
-      if (session.needsRestore) {
-        const restored = await restoreSession(sessionId);
-        if (!restored) {
-          console.log(`Failed to restore session ${sessionId}, will retry later`);
-          sessionBusy[sessionId] = false;
-          continue;
-        }
-      }
-      
-      console.log(`Running maintenance for session ${sessionId}...`);
-      
-      // Get the page from the session
-      const page = session.page;
-      
-      if (!page) {
-        console.log(`No page for session ${sessionId}, skipping`);
-        sessionBusy[sessionId] = false;
-        continue;
-      }
-      
-      // Check if still logged in
-      const isLoggedIn = await checkIfLoggedIn(page);
-      
-      if (!isLoggedIn) {
-        console.log(`⚠️ Session ${sessionId} is not logged in, attempting to re-login...`);
-        
-        // Try automatic re-login
-        const credentials = session.credentials;
-        
-        if (credentials && credentials.phoneNumber && credentials.pin) {
-          console.log("Attempting automatic re-login...");
-          
-          // Navigate to Trade Republic
-          await page.goto("https://app.traderepublic.com/portfolio", { 
-            waitUntil: 'networkidle2',
-            timeout: 30000
-          });
-          
-          // Login again
-          const loginResult = await loginToTradeRepublic(page, credentials);
-          
-          if (loginResult.success) {
-            console.log(`✅ Automatic re-login successful for session ${sessionId}`);
-            session.lastActivity = Date.now();
-          } else if (loginResult.needs2FA) {
-            console.log(`❌ Automatic re-login failed - 2FA required for session ${sessionId}`);
-            // Keep the session, we'll try again later
-          } else {
-            console.log(`❌ Automatic re-login failed for session ${sessionId}`);
-            // Keep the session, we'll try again later
-          }
-        } else {
-          console.log(`No credentials for session ${sessionId}, can't reconnect`);
-        }
-      } else {
-        console.log(`✅ Session ${sessionId} is logged in, simulating user activity...`);
-        
-        // Simulate user activity by navigating to different pages
-        await simulateUserActivity(page);
-        
-        // Update last activity timestamp
-        session.lastActivity = Date.now();
-        console.log(`✅ Maintenance completed for session ${sessionId}`);
-      }
-    } catch (error) {
-      console.log(`Error maintaining session ${sessionId}: ${error.message}`);
-    } finally {
-      // Always release the session when maintenance is done
-      sessionBusy[sessionId] = false;
-      
-      // Check if there are queued requests to process now
-      if (sessionQueues[sessionId] && sessionQueues[sessionId].length > 0) {
-        console.log(`Maintenance completed for ${sessionId}, processing ${sessionQueues[sessionId].length} queued requests`);
-        processNextQueuedRequest(sessionId);
-      }
-    }
-  }
-  
-  console.log(`[${new Date().toISOString()}] Page refresh with navigation completed`);
-  
-  // Save sessions to file after maintenance
-  saveSessionsToFile();
-  
-}, AUTO_REFRESH_INTERVAL);
-
-// Cleanup stale sessions only after 30 days of inactivity
-setInterval(() => {
-  const now = Date.now();
-  const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-  
-  Object.keys(sessions).forEach(sessionId => {
-    const session = sessions[sessionId];
-    // Only close extremely old sessions (30 days)
-    if (now - session.lastActivity > thirtyDays) {
-      console.log(`Closing very old session: ${sessionId}`);
-      try {
-        if (session.browser) {
-          session.browser.close();
-        }
-      } catch (error) {
-        console.error(`Error closing browser: ${error.message}`);
-      }
-      delete sessions[sessionId];
-    }
-  });
-  
-  // Save sessions to file after cleanup
-  saveSessionsToFile();
-  
-}, 24 * 60 * 60 * 1000); // Run once per day
 
 // Helper functions
 
@@ -667,17 +303,6 @@ async function checkIfLoggedIn(page) {
       } catch (error) {
         continue;
       }
-    }
-    
-    // Check for PIN input field - this means we're still logged in but need PIN
-    const hasPinInput = await page.evaluate(() => {
-      return !!document.querySelector('fieldset#loginPin__input');
-    });
-    
-    if (hasPinInput) {
-      // If PIN input is showing, we're still logged in but need to enter PIN
-      console.log("Found PIN re-authentication prompt - session needs PIN");
-      return false; // We'll handle this as "not logged in" so the maintenance flow will re-login
     }
     
     logDebug("No login indicators found");
@@ -1071,7 +696,7 @@ async function clickSinceBuyEuroOption(page) {
 }
 
 // Get portfolio data
-async function getPortfolioData(page, isRefresh = false) {
+async function getPortfolioData(page) {
   const data = {
     portfolio_balance: "Not available",
     positions: [],
@@ -1102,13 +727,9 @@ async function getPortfolioData(page, isRefresh = false) {
       console.log(`Error getting portfolio balance: ${error.message}`);
     }
     
-    // Set view to show "Since buy (€)" - but only on first load, not on refresh
-    if (!isRefresh) {
-      console.log("\nSetting view to show Euro values...");
-      await clickSinceBuyEuroOption(page);
-    } else {
-      logDebug("Skipping dropdown selection (using existing view)");
-    }
+    // Set view to show "Since buy (€)"
+    console.log("\nSetting view to show Euro values...");
+    await clickSinceBuyEuroOption(page);
     
     // Get all position data
     try {
@@ -1293,11 +914,6 @@ async function getPortfolioData(page, isRefresh = false) {
         } else {
           console.log("Cash balance element not found on transactions page");
         }
-        
-        // Navigate back to portfolio
-        console.log("Navigating back to portfolio...");
-        await page.goBack();
-        await sleep(1000);
       } else {
         console.log("Could not find transactions link");
       }
@@ -1324,63 +940,8 @@ app.get('/api/ping', (req, res) => {
   });
 });
 
-// DELETE - Close a session - IMPROVED WITH QUEUE
-app.delete('/api/session/:sessionId', async (req, res) => {
-  const { sessionId } = req.params;
-  
-  // Check if session exists
-  if (!sessionId || !sessions[sessionId]) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  // Define handler for closing session
-  const closeSessionHandler = async () => {
-    try {
-      console.log(`Closing session ${sessionId} by user request...`);
-      
-      // Close browser
-      if (sessions[sessionId].browser) {
-        await sessions[sessionId].browser.close();
-      }
-      
-      // Delete session
-      delete sessions[sessionId];
-      
-      // Save sessions after deletion
-      saveSessionsToFile();
-      
-      // Clean up queue if it exists
-      delete sessionQueues[sessionId];
-      
-      return res.json({ 
-        success: true, 
-        message: `Session ${sessionId} closed successfully` 
-      });
-    } catch (error) {
-      console.log(`Error closing session ${sessionId}: ${error.message}`);
-      
-      // Delete session regardless of error
-      delete sessions[sessionId];
-      
-      // Clean up queue if it exists
-      delete sessionQueues[sessionId];
-      
-      // Save sessions after deletion
-      saveSessionsToFile();
-      
-      return res.json({ 
-        success: true, 
-        message: `Session ${sessionId} deleted with errors: ${error.message}` 
-      });
-    }
-  };
-  
-  // Queue the session closure
-  queueSessionRequest(sessionId, closeSessionHandler, res);
-});
-
-// POST - Start a new session and login
-app.post('/api/login', limiter, async (req, res) => {
+// POST - Login and get portfolio data (one-time use)
+app.post('/api/getdata', limiter, async (req, res) => {
   const { phoneNumber, pin, twoFACode } = req.body;
   
   // Validate inputs
@@ -1388,517 +949,125 @@ app.post('/api/login', limiter, async (req, res) => {
     return res.status(400).json({ error: 'Phone number and PIN are required' });
   }
   
-  // Create a new session
-  const sessionId = uuidv4();
-  
-  try {
-    // Launch browser
-    const browser = await setupBrowser();
-    
-    if (!browser) {
-      return res.status(500).json({ 
-        success: false, 
-        error: 'Failed to launch browser' 
-      });
-    }
-    
-    console.log(`✅ Browser launched for session: ${sessionId}`);
-    
-    // Create session
-    sessions[sessionId] = {
-      browser,
-      lastActivity: Date.now(),
-      credentials: {
-        phoneNumber,
-        pin
-      }
-    };
-    
-    // Prepare handler function for the actual login process
-    const loginHandler = async () => {
-      try {
-        // Use first page
-        const pages = await browser.pages();
-        const page = pages[0];
-        
-        // Set realistic user agent
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
-        // Navigate to Trade Republic
-        console.log("\n🌐 Opening Trade Republic portfolio...");
-        await page.goto("https://app.traderepublic.com/portfolio", { 
-          waitUntil: 'networkidle2',
-          timeout: 30000
-        });
-        console.log("✅ Trade Republic page loaded");
-        
-        // Store page in session
-        sessions[sessionId].page = page;
-        
-        // Handle login
-        const loginResult = await loginToTradeRepublic(page, { phoneNumber, pin, twoFACode });
-        
-        if (loginResult.success) {
-          console.log("\n🎉 Login successful");
-          
-          // Get portfolio data
-          const data = await getPortfolioData(page);
-          
-          // Save sessions
-          saveSessionsToFile();
-          
-          // Return success with sessionId
-          return res.json({
-            success: true,
-            sessionId,
-            data
-          });
-        } else if (loginResult.needs2FA) {
-          console.log("\n📱 2FA required");
-          
-          // Save sessions (even though not fully authenticated yet)
-          saveSessionsToFile();
-          
-          // Return with 2FA required status
-          return res.status(200).json({
-            success: false,
-            needs2FA: true,
-            sessionId // Return the sessionId so client can use it for 2FA submission
-          });
-        } else {
-          console.log("\n❌ Login failed");
-          
-          // Clean up failed session
-          try {
-            await browser.close();
-          } catch (error) {
-            console.log(`Error closing browser: ${error.message}`);
-          }
-          
-          delete sessions[sessionId];
-          
-          // Save sessions after deletion
-          saveSessionsToFile();
-          
-          return res.status(401).json({
-            success: false,
-            error: loginResult.error || 'Login failed - check credentials'
-          });
-        }
-      } catch (error) {
-        console.log(`❌ Error during login: ${error.message}`);
-        
-        // Clean up session on error
-        try {
-          await browser.close();
-        } catch (closeError) {
-          console.log(`Error closing browser: ${closeError.message}`);
-        }
-        
-        delete sessions[sessionId];
-        
-        return res.status(500).json({ 
-          success: false,
-          error: 'Server error: ' + error.message 
-        });
-      }
-    };
-    
-    // Login is a special case - since this is a new session, we don't need to queue
-    // We can immediately execute the login handler
-    sessionBusy[sessionId] = true;
-    await loginHandler();
-    sessionBusy[sessionId] = false;
-    
-  } catch (error) {
-    console.log(`❌ Error setting up session: ${error.message}`);
-    
-    // Clean up session on error
-    if (sessions[sessionId]?.browser) {
-      try {
-        await sessions[sessionId].browser.close();
-      } catch (closeError) {
-        console.log(`Error closing browser: ${closeError.message}`);
-      }
-    }
-    
-    delete sessions[sessionId];
-    
-    return res.status(500).json({ 
-      success: false,
-      error: 'Server error: ' + error.message 
-    });
-  }
-});
-
-// POST - Submit 2FA code for an existing session - IMPROVED WITH QUEUE
-app.post('/api/submit-2fa', limiter, async (req, res) => {
-  const { sessionId, twoFACode } = req.body;
-  
-  // Validate inputs
-  if (!sessionId || !twoFACode) {
-    return res.status(400).json({ error: 'Session ID and 2FA code are required' });
-  }
-  
-  // Check if session exists
-  if (!sessions[sessionId]) {
-    return res.status(404).json({ error: 'Session not found or expired' });
-  }
-  
-  // Define handler for 2FA submission
-  const submit2FAHandler = async () => {
-    // Check if session needs to be restored
-    if (sessions[sessionId].needsRestore) {
-      const restored = await restoreSession(sessionId);
-      if (!restored) {
-        return res.status(500).json({ error: 'Failed to restore session' });
-      }
-    }
+  // Create handler function for data retrieval
+  const getDataHandler = async () => {
+    let browser = null;
     
     try {
-      // Update last activity timestamp
-      sessions[sessionId].lastActivity = Date.now();
+      // Launch browser
+      browser = await setupBrowser();
       
-      // Get page from session
-      const page = sessions[sessionId].page;
-      
-      if (!page) {
-        return res.status(500).json({ error: 'Session page not found' });
+      if (!browser) {
+        return res.status(500).json({ 
+          success: false, 
+          error: 'Failed to launch browser' 
+        });
       }
       
-      // Submit 2FA code
-      const twoFAResult = await handle2FA(page, twoFACode);
+      console.log(`✅ Browser launched for one-time data retrieval`);
       
-      if (twoFAResult.success) {
-        console.log("✅ 2FA verification successful");
+      // Use first page
+      const pages = await browser.pages();
+      const page = pages[0];
+      
+      // Set realistic user agent
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+      
+      // Navigate to Trade Republic
+      console.log("\n🌐 Opening Trade Republic portfolio...");
+      await page.goto("https://app.traderepublic.com/portfolio", { 
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+      console.log("✅ Trade Republic page loaded");
+      
+      // Handle login
+      const loginResult = await loginToTradeRepublic(page, { phoneNumber, pin, twoFACode });
+      
+      if (loginResult.success) {
+        console.log("\n🎉 Login successful");
         
-        // Wait for login to complete
-        console.log("Waiting for login to complete...");
-        await sleep(2000);
+        // Get portfolio data
+        const data = await getPortfolioData(page);
         
-        // Check login status
-        const isLoggedIn = await checkIfLoggedIn(page);
+        // Return success with data
+        return res.json({
+          success: true,
+          data,
+          timestamp: new Date().toISOString()
+        });
+      } else if (loginResult.needs2FA) {
+        console.log("\n📱 2FA required");
         
-        if (isLoggedIn) {
-          console.log("✅ Successfully logged in after 2FA");
-          
-          // Get portfolio data
-          const data = await getPortfolioData(page);
-          
-          // Save sessions
-          saveSessionsToFile();
-          
-          // Return success with data
-          return res.json({
-            success: true,
-            sessionId,
-            data
-          });
-        } else {
-          console.log("❌ Login failed after 2FA");
-          
-          return res.status(401).json({
-            success: false,
-            error: 'Login failed after 2FA verification'
-          });
-        }
+        // Generate a temporary token for 2FA submission
+        const token = uuidv4();
+        
+        // Store browser for 2FA submission (will be cleaned up after 5 minutes)
+        const tempData = { browser, page, phoneNumber, pin, createdAt: Date.now() };
+        
+        // Set a timeout to clean up the browser after 5 minutes
+        setTimeout(async () => {
+          try {
+            if (tempData.browser) {
+              await tempData.browser.close();
+              console.log(`Cleaned up expired 2FA browser session`);
+            }
+          } catch (error) {
+            console.log(`Error cleaning up browser: ${error.message}`);
+          }
+        }, 5 * 60 * 1000); // 5 minutes
+        
+        // Return with 2FA required status and token
+        return res.status(200).json({
+          success: false,
+          needs2FA: true,
+          token
+        });
       } else {
-        console.log("❌ 2FA verification failed");
+        console.log("\n❌ Login failed");
         
         return res.status(401).json({
           success: false,
-          error: twoFAResult.error || '2FA verification failed'
+          error: loginResult.error || 'Login failed - check credentials'
         });
       }
-      
     } catch (error) {
-      console.log(`❌ Error during 2FA submission: ${error.message}`);
+      console.log(`❌ Error during data retrieval: ${error.message}`);
       
       return res.status(500).json({ 
         success: false,
         error: 'Server error: ' + error.message 
       });
+    } finally {
+      // Always close the browser when finished
+      if (browser) {
+        try {
+          await browser.close();
+          console.log("Browser closed after data retrieval");
+        } catch (error) {
+          console.log(`Error closing browser: ${error.message}`);
+        }
+      }
     }
   };
   
-  // Queue the 2FA submission
-  queueSessionRequest(sessionId, submit2FAHandler, res);
-});
-
-// GET - Refresh portfolio data for an existing session - IMPROVED WITH QUEUE
-app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
-  const { sessionId } = req.params;
-  
-  // Check if session exists
-  if (!sessionId || !sessions[sessionId]) {
-    return res.status(404).json({ error: 'Session not found or expired' });
-  }
-  
-  // Define handler for refreshing data
-  const refreshHandler = async () => {
-    // Check if session needs to be restored
-    if (sessions[sessionId].needsRestore) {
-      const restored = await restoreSession(sessionId);
-      if (!restored) {
-        return res.status(500).json({ error: 'Failed to restore session' });
-      }
-    }
-    
-    try {
-      // Update last activity timestamp
-      sessions[sessionId].lastActivity = Date.now();
-      
-      // Get page from session
-      const page = sessions[sessionId].page;
-      
-      if (!page) {
-        return res.status(500).json({ error: 'Session page not found' });
-      }
-      
-      // Simulate user activity
-      await simulateUserActivity(page);
-      
-      // Get updated portfolio data
-      const data = await getPortfolioData(page, true);
-      
-      // Return success with data
-      return res.json({
-        success: true,
-        data
-      });
-      
-    } catch (error) {
-      console.log(`❌ Error during refresh: ${error.message}`);
-      
-      return res.status(500).json({ 
-        success: false,
-        error: 'Server error: ' + error.message 
-      });
-    }
-  };
-  
-  // Queue the refresh request
-  queueSessionRequest(sessionId, refreshHandler, res);
+  // Queue the data retrieval request
+  queueRequest(getDataHandler, res);
 });
 
 // GET - Check API status
 app.get('/api/status', (req, res) => {
-  // Calculate active queue sizes
-  const queueSizes = {};
-  Object.keys(sessionQueues).forEach(sessionId => {
-    if (sessionQueues[sessionId].length > 0) {
-      queueSizes[sessionId] = sessionQueues[sessionId].length;
-    }
-  });
-  
-  // Count busy sessions
-  const busySessions = Object.keys(sessionBusy).filter(id => sessionBusy[id]).length;
-  
   res.json({ 
     status: 'ok',
-    service: 'Trade Republic API',
-    version: '1.8.0', // Updated version
-    activeSessions: Object.keys(sessions).length,
-    busySessions,
-    queuedRequests: queueSizes,
-    autoRefreshMinutes: AUTO_REFRESH_INTERVAL / 60000,
+    service: 'Trade Republic Data Retriever API',
+    version: '1.0.0',
+    mode: 'One-time data retrieval',
+    activeRequests: activeBrowsers,
+    queuedRequests: requestQueue.length,
+    maxConcurrentBrowsers: MAX_CONCURRENT_BROWSERS,
     autoPingMinutes: PING_INTERVAL / 60000,
-    persistence: true,
-    preventSpinDown: true,
-    maintenanceStrategy: "Page refresh with navigation every 8 minutes"
+    preventSpinDown: true
   });
-});
-
-// For backwards compatibility - map old endpoint to new login endpoint
-app.post('/api/portfolio', limiter, async (req, res) => {
-  // Just forward to the login endpoint
-  console.log("Legacy /api/portfolio endpoint called, forwarding to /api/login");
-  
-  // Forward the request to /api/login handler
-  const { phoneNumber, pin, twoFACode } = req.body;
-  
-  if (!phoneNumber || !pin) {
-    return res.status(400).json({ error: 'Phone number and PIN are required' });
-  }
-  
-  // Create a new session
-  const sessionId = uuidv4();
-  
-  try {
-    // Launch browser
-    const browser = await setupBrowser();
-    
-    if (!browser) {
-      return res.status(500).json({ 
-        success: false, 
-        error: 'Failed to launch browser' 
-      });
-    }
-    
-    console.log(`✅ Browser launched for session: ${sessionId}`);
-    
-    // Create session
-    sessions[sessionId] = {
-      browser,
-      lastActivity: Date.now(),
-      credentials: {
-        phoneNumber,
-        pin
-      }
-    };
-    
-    // Define handler for portfolio login
-    const portfolioLoginHandler = async () => {
-      try {
-        // Use first page
-        const pages = await browser.pages();
-        const page = pages[0];
-        
-        // Set realistic user agent
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
-        // Navigate to Trade Republic
-        console.log("\n🌐 Opening Trade Republic portfolio...");
-        await page.goto("https://app.traderepublic.com/portfolio", { 
-          waitUntil: 'networkidle2',
-          timeout: 30000
-        });
-        console.log("✅ Trade Republic page loaded");
-        
-        // Store page in session
-        sessions[sessionId].page = page;
-        
-        // Handle login
-        const loginResult = await loginToTradeRepublic(page, { phoneNumber, pin, twoFACode });
-        
-        if (loginResult.success) {
-          console.log("\n🎉 Login successful");
-          
-          // Get portfolio data
-          const data = await getPortfolioData(page);
-          
-          // Save sessions
-          saveSessionsToFile();
-          
-          // Return success with sessionId and data in the old format for compatibility
-          return res.json({
-            success: true,
-            data,
-            // Include sessionId so client can use it for refresh
-            sessionId
-          });
-        } else if (loginResult.needs2FA) {
-          console.log("\n📱 2FA required");
-          
-          // Save sessions
-          saveSessionsToFile();
-          
-          // Return with 2FA required status in a format compatible with old clients
-          return res.status(401).json({
-            success: false,
-            error: "2FA code required",
-            needs2FA: true,
-            sessionId // Return the sessionId so client can use it for 2FA submission
-          });
-        } else {
-          console.log("\n❌ Login failed");
-          
-          // Clean up failed session
-          try {
-            await browser.close();
-          } catch (error) {
-            console.log(`Error closing browser: ${error.message}`);
-          }
-          
-          delete sessions[sessionId];
-          
-          return res.status(401).json({
-            success: false,
-            error: loginResult.error || 'Login failed - check credentials'
-          });
-        }
-      } catch (error) {
-        console.log(`❌ Error during portfolio login: ${error.message}`);
-        
-        // Clean up session on error
-        try {
-          await browser.close();
-        } catch (closeError) {
-          console.log(`Error closing browser: ${closeError.message}`);
-        }
-        
-        delete sessions[sessionId];
-        
-        return res.status(500).json({ 
-          success: false,
-          error: 'Server error: ' + error.message 
-        });
-      }
-    };
-    
-    // Login is a special case - since this is a new session, we don't need to queue
-    // We can immediately execute the handler
-    sessionBusy[sessionId] = true;
-    await portfolioLoginHandler();
-    sessionBusy[sessionId] = false;
-  } catch (error) {
-    console.log(`❌ Error: ${error.message}`);
-    return res.status(500).json({ 
-      success: false,
-      error: 'Server error: ' + error.message 
-    });
-  }
-});
-
-// Graceful shutdown - Save sessions before closing
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, saving sessions before shutdown...');
-  
-  // Save all sessions to file
-  saveSessionsToFile();
-  
-  // Close all browsers, but don't delete the sessions from memory
-  // This way they can be restored when the server restarts
-  for (const sessionId in sessions) {
-    try {
-      if (sessions[sessionId].browser) {
-        await sessions[sessionId].browser.close();
-        sessions[sessionId].browser = null;
-        sessions[sessionId].page = null;
-        sessions[sessionId].needsRestore = true;
-      }
-    } catch (error) {
-      console.log(`Error closing browser for session ${sessionId}: ${error.message}`);
-    }
-  }
-  
-  console.log('Graceful shutdown complete');
-  process.exit(0);
-});
-
-// Same for SIGINT
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, saving sessions before shutdown...');
-  
-  // Save all sessions to file
-  saveSessionsToFile();
-  
-  // Close all browsers, but don't delete the sessions
-  for (const sessionId in sessions) {
-    try {
-      if (sessions[sessionId].browser) {
-        await sessions[sessionId].browser.close();
-        sessions[sessionId].browser = null;
-        sessions[sessionId].page = null;
-        sessions[sessionId].needsRestore = true;
-      }
-    } catch (error) {
-      console.log(`Error closing browser for session ${sessionId}: ${error.message}`);
-    }
-  }
-  
-  console.log('Graceful shutdown complete');
-  process.exit(0);
 });
 
 // Do an initial ping when the server starts
@@ -1907,9 +1076,7 @@ setTimeout(pingService, 5000);
 // Start the server
 app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
-  console.log(`Automatic page refresh with navigation EVERY ${AUTO_REFRESH_INTERVAL/60000} MINUTES`);
+  console.log(`One-time data retrieval mode - No session persistence`);
   console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
-  console.log(`Sessions will be kept alive for 30 DAYS of inactivity`);
-  console.log(`Session persistence ENABLED - Sessions will survive server restarts`);
-  console.log(`Version 1.8.0 - Using page navigation every 8 minutes to simulate user activity`);
+  console.log(`Max concurrent browsers: ${MAX_CONCURRENT_BROWSERS}`);
 });
