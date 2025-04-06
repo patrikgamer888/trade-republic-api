@@ -17,12 +17,6 @@ const PORT = process.env.PORT || 10000;
 // Debug logging control
 const DEBUG_LOGGING = process.env.DEBUG_LOGGING === 'true';
 
-// Queue system for managing requests
-const requestQueue = [];
-const MAX_QUEUE_TIME = 30000; // Maximum wait time (30 seconds)
-const MAX_CONCURRENT_BROWSERS = 2; // Maximum number of concurrent browser instances
-let activeBrowsers = 0; // Track number of active browser instances
-
 // Function to log debug messages
 function logDebug(message) {
   if (DEBUG_LOGGING) {
@@ -31,7 +25,6 @@ function logDebug(message) {
 }
 
 // Self-ping mechanism to prevent Render from spinning down
-// Render free tier spins down after 15 minutes of inactivity
 const PING_INTERVAL = 10 * 60 * 1000; // 10 minutes
 const SERVICE_URL = process.env.SERVICE_URL || 'https://trade-republic-api.onrender.com';
 
@@ -106,77 +99,74 @@ app.use((req, res, next) => {
   apiKeyAuth(req, res, next);
 });
 
-// Queue management functions
-function queueRequest(handlerFunction, res) {
-  // Add request to queue
-  const queuedRequest = {
-    handler: handlerFunction,
-    queuedAt: Date.now(),
-    expiresAt: Date.now() + MAX_QUEUE_TIME,
-    res
-  };
-  
-  requestQueue.push(queuedRequest);
-  
-  console.log(`Request queued. Queue length: ${requestQueue.length}`);
-  
-  // Process queue if possible
-  processQueue();
-}
+// Simple queue system for managing concurrent requests
+const requestQueue = [];
+let activeRequests = 0;
+const MAX_CONCURRENT_REQUESTS = 2;
 
-async function processQueue() {
-  // If queue is empty or max concurrent browsers reached, nothing to do
-  if (requestQueue.length === 0 || activeBrowsers >= MAX_CONCURRENT_BROWSERS) {
+// Process queue function
+function processQueue() {
+  if (requestQueue.length === 0 || activeRequests >= MAX_CONCURRENT_REQUESTS) {
     return;
   }
   
   // Get next request from queue
-  const request = requestQueue.shift();
+  const nextRequest = requestQueue.shift();
   
-  // Check if request has expired
-  if (Date.now() > request.expiresAt) {
-    console.log(`Request expired in queue.`);
+  // Increment active requests
+  activeRequests++;
+  
+  // Execute the handler
+  nextRequest.handler().finally(() => {
+    // Decrement active requests
+    activeRequests--;
     
-    // Send timeout response
-    if (!request.res.headersSent) {
-      request.res.status(408).json({
-        success: false,
-        error: 'Request timed out waiting in queue'
-      });
-    }
-    
-    // Process next request
+    // Process next item in queue
     processQueue();
-    return;
-  }
-  
-  // Increment active browser count
-  activeBrowsers++;
-  
-  try {
-    // Process the request
-    console.log(`Processing queued request. Wait time: ${(Date.now() - request.queuedAt)/1000}s`);
-    await request.handler();
-  } catch (error) {
-    console.error(`Error processing queued request: ${error.message}`);
-    
-    // Handle response error if not already sent
-    if (!request.res.headersSent) {
-      request.res.status(500).json({
-        success: false,
-        error: `Server error: ${error.message}`
-      });
-    }
-  } finally {
-    // Decrement active browser count
-    activeBrowsers--;
-    
-    // Process next request if any
-    processQueue();
-  }
+  });
 }
 
-// Helper functions
+// Add request to queue
+function queueRequest(handler, res) {
+  // Add to queue
+  requestQueue.push({
+    handler,
+    res
+  });
+  
+  console.log(`Request added to queue. Queue length: ${requestQueue.length}`);
+  
+  // Try to process queue
+  processQueue();
+}
+
+// ===== BROWSER SESSIONS FOR 2FA =====
+// We need to store browser sessions during 2FA flow
+const pendingSessions = new Map();
+
+// Cleanup expired sessions every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  
+  for (const [token, session] of pendingSessions.entries()) {
+    // Check if session has expired (5 minutes)
+    if (now - session.createdAt > 5 * 60 * 1000) {
+      console.log(`Cleaning up expired session: ${token}`);
+      
+      // Close browser if still open
+      if (session.browser) {
+        session.browser.close().catch(err => {
+          console.error(`Error closing browser: ${err.message}`);
+        });
+      }
+      
+      // Remove from map
+      pendingSessions.delete(token);
+    }
+  }
+}, 60 * 1000);
+
+// ===== BROWSER HELPER FUNCTIONS =====
 
 // Simplified sleep function
 function sleep(ms) {
@@ -194,26 +184,26 @@ async function fastType(page, selector, text) {
 // Wait for element function
 async function waitForElement(page, selector, timeout = 5000, description = "element") {
   try {
-    logDebug(`👀 Looking for: ${description}`);
+    logDebug(`Looking for: ${description}`);
     const element = await page.waitForSelector(selector, { 
       visible: true, 
       timeout: timeout 
     });
     
     if (element) {
-      logDebug(`✅ Found: ${description}`);
+      logDebug(`Found: ${description}`);
       return element;
     } else {
-      logDebug(`⚠️ Element found but may not be visible: ${description}`);
+      logDebug(`Element found but may not be visible: ${description}`);
       return null;
     }
   } catch (error) {
-    logDebug(`❌ Could not find: ${description} - ${error.message}`);
+    logDebug(`Could not find: ${description} - ${error.message}`);
     return null;
   }
 }
 
-// Setup browser for headless environment
+// Setup browser
 async function setupBrowser() {
   console.log("Setting up browser in headless mode...");
   
@@ -250,6 +240,8 @@ async function setupBrowser() {
     }
   }
 }
+
+// ===== TRADE REPUBLIC FUNCTIONS =====
 
 // Check if already logged in
 async function checkIfLoggedIn(page) {
@@ -928,27 +920,7 @@ async function getPortfolioData(page) {
   }
 }
 
-// Define API routes
-
-// Clean up expired temp sessions
-setInterval(() => {
-  const now = Date.now();
-  const fiveMinutes = 5 * 60 * 1000;
-  
-  Object.keys(tempSessions).forEach(token => {
-    if (now - tempSessions[token].createdAt > fiveMinutes) {
-      try {
-        if (tempSessions[token].browser) {
-          tempSessions[token].browser.close();
-          console.log(`Auto-cleaned up expired 2FA browser session for token: ${token}`);
-        }
-      } catch (error) {
-        console.log(`Error cleaning up browser: ${error.message}`);
-      }
-      delete tempSessions[token];
-    }
-  });
-}, 60 * 1000); // Check every minute
+// ===== API ROUTES =====
 
 // Special endpoint for self-pinging
 app.get('/api/ping', (req, res) => {
@@ -960,61 +932,137 @@ app.get('/api/ping', (req, res) => {
   });
 });
 
-// Temporary sessions for 2FA flow
-const tempSessions = {};
-
-// Clean up expired temp sessions
-setInterval(() => {
-  const now = Date.now();
-  const fiveMinutes = 5 * 60 * 1000;
-  
-  Object.keys(tempSessions).forEach(token => {
-    if (now - tempSessions[token].createdAt > fiveMinutes) {
-      try {
-        if (tempSessions[token].browser) {
-          tempSessions[token].browser.close();
-          console.log(`Auto-cleaned up expired 2FA browser session for token: ${token}`);
-        }
-      } catch (error) {
-        console.log(`Error cleaning up browser: ${error.message}`);
-      }
-      delete tempSessions[token];
-    }
+// GET - Check API status
+app.get('/api/status', (req, res) => {
+  res.json({ 
+    status: 'ok',
+    service: 'Trade Republic One-Time Data API',
+    version: '1.0.0',
+    activeRequests,
+    queuedRequests: requestQueue.length,
+    pendingSessions: pendingSessions.size,
+    maxConcurrentRequests: MAX_CONCURRENT_REQUESTS,
+    autoPingMinutes: PING_INTERVAL / 60000,
+    preventSpinDown: true
   });
-}, 60 * 1000); // Check every minute
+});
 
-// POST - Login and get portfolio data (one-time use)
-// Original endpoint for backward compatibility
-app.post('/api/login', limiter, async (req, res) => {
+// GET DATA endpoint - handles login and retrieval
+app.post('/api/getdata', limiter, async (req, res) => {
   const { phoneNumber, pin, twoFACode } = req.body;
   
-  // Validate inputs
+  // Validate required fields
   if (!phoneNumber || !pin) {
-    return res.status(400).json({ error: 'Phone number and PIN are required' });
+    return res.status(400).json({
+      success: false,
+      error: 'Phone number and PIN are required'
+    });
   }
   
-  // Create handler function for data retrieval
-  const getDataHandler = async () => {
+  // Create handler function
+  const handler = async () => {
     let browser = null;
     
     try {
+      console.log(`Processing request for phone number ${phoneNumber.substring(0, 2)}***`);
+      
+      // First, check if this is a follow-up request with a 2FA code
+      if (twoFACode) {
+        console.log("2FA code provided, checking for pending session...");
+        
+        // Find session by phone/pin
+        for (const [token, session] of pendingSessions.entries()) {
+          if (session.phoneNumber === phoneNumber && session.pin === pin) {
+            console.log(`Found pending 2FA session for ${phoneNumber.substring(0, 2)}***`);
+            
+            try {
+              // Re-use the existing browser and page
+              browser = session.browser;
+              const page = session.page;
+              
+              // Submit 2FA code
+              console.log("Submitting 2FA code...");
+              const twoFAResult = await handle2FA(page, twoFACode);
+              
+              if (twoFAResult.success) {
+                console.log("✅ 2FA verification successful");
+                
+                // Wait for login to complete
+                console.log("Waiting for login to complete...");
+                await sleep(2000);
+                
+                // Final check to verify login success
+                const isLoggedIn = await checkIfLoggedIn(page);
+                
+                if (isLoggedIn) {
+                  console.log("✅ Successfully logged in after 2FA!");
+                  
+                  // Get portfolio data
+                  const data = await getPortfolioData(page);
+                  
+                  // Success! Return data
+                  return res.json({
+                    success: true,
+                    data
+                  });
+                } else {
+                  console.log("❌ Login verification failed after 2FA");
+                  return res.status(401).json({
+                    success: false,
+                    error: "Login verification failed after 2FA"
+                  });
+                }
+              } else {
+                console.log("❌ 2FA verification failed");
+                return res.status(401).json({
+                  success: false,
+                  error: twoFAResult.error || "2FA verification failed"
+                });
+              }
+            } catch (error) {
+              console.log(`Error processing 2FA: ${error.message}`);
+              return res.status(500).json({
+                success: false,
+                error: `Server error: ${error.message}`
+              });
+            } finally {
+              // Clean up the session regardless of outcome
+              console.log("Closing browser after 2FA processing");
+              try {
+                await browser.close();
+              } catch (error) {
+                console.log(`Error closing browser: ${error.message}`);
+              }
+              
+              // Remove from pending sessions
+              pendingSessions.delete(token);
+            }
+          }
+        }
+        
+        console.log("No matching pending 2FA session found, starting fresh login");
+      }
+      
+      // This is either a new request or no matching pending session was found
+      // Start a fresh login process
+      
       // Launch browser
       browser = await setupBrowser();
       
       if (!browser) {
-        return res.status(500).json({ 
-          success: false, 
-          error: 'Failed to launch browser' 
+        return res.status(500).json({
+          success: false,
+          error: "Failed to launch browser"
         });
       }
       
-      console.log(`✅ Browser launched for one-time data retrieval`);
+      console.log("✅ Browser launched");
       
-      // Use first page
+      // Get first page
       const pages = await browser.pages();
       const page = pages[0];
       
-      // Set realistic user agent
+      // Set user agent
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
       
       // Navigate to Trade Republic
@@ -1037,60 +1085,56 @@ app.post('/api/login', limiter, async (req, res) => {
         // Return success with data
         return res.json({
           success: true,
-          data,
-          timestamp: new Date().toISOString()
+          data
         });
       } else if (loginResult.needs2FA) {
         console.log("\n📱 2FA required");
         
-        // Generate a temporary token for 2FA submission
+        // Generate token for 2FA session
         const token = uuidv4();
         
-        // Store browser for 2FA submission (will be cleaned up after 5 minutes)
-        const tempData = { browser, page, phoneNumber, pin, createdAt: Date.now() };
+        // Store the session for later use
+        pendingSessions.set(token, {
+          browser,
+          page,
+          phoneNumber,
+          pin,
+          createdAt: Date.now()
+        });
         
-        // Set a timeout to clean up the browser after 5 minutes
-        setTimeout(async () => {
-          try {
-            if (tempData.browser) {
-              await tempData.browser.close();
-              console.log(`Cleaned up expired 2FA browser session`);
-            }
-          } catch (error) {
-            console.log(`Error cleaning up browser: ${error.message}`);
-          }
-        }, 5 * 60 * 1000); // 5 minutes
+        console.log(`Stored browser session for 2FA. Token: ${token.substring(0, 8)}...`);
+        console.log("LEAVING BROWSER OPEN - waiting for 2FA code submission");
         
-        // Store the temporary session data with token
-        tempSessions[token] = tempData;
+        // Set browser to null to prevent it from being closed in finally block
+        browser = null;
         
-        // Return with 2FA required status and sessionId (token)
+        // Return needs2FA response
         return res.status(200).json({
           success: false,
           needs2FA: true,
-          sessionId: token
+          message: "2FA code required. Please submit the code you received via SMS."
         });
       } else {
         console.log("\n❌ Login failed");
         
         return res.status(401).json({
           success: false,
-          error: loginResult.error || 'Login failed - check credentials'
+          error: loginResult.error || "Login failed - check your credentials"
         });
       }
     } catch (error) {
-      console.log(`❌ Error during data retrieval: ${error.message}`);
+      console.log(`❌ Error during request: ${error.message}`);
       
-      return res.status(500).json({ 
+      return res.status(500).json({
         success: false,
-        error: 'Server error: ' + error.message 
+        error: `Server error: ${error.message}`
       });
     } finally {
-      // Always close the browser when finished
+      // Close browser only if it's not stored in pendingSessions
       if (browser) {
+        console.log("Closing browser at end of request");
         try {
           await browser.close();
-          console.log("Browser closed after data retrieval");
         } catch (error) {
           console.log(`Error closing browser: ${error.message}`);
         }
@@ -1098,214 +1142,14 @@ app.post('/api/login', limiter, async (req, res) => {
     }
   };
   
-  // Queue the data retrieval request
-  queueRequest(getDataHandler, res);
+  // Queue the request
+  queueRequest(handler, res);
 });
 
-// POST - Submit 2FA code for an existing session
-app.post('/api/submit-2fa', limiter, async (req, res) => {
-  const { sessionId, twoFACode } = req.body;
-  
-  // Validate inputs
-  if (!sessionId || !twoFACode) {
-    return res.status(400).json({ error: 'Session ID and 2FA code are required' });
-  }
-  
-  // Check if session exists in temp sessions
-  if (!tempSessions[sessionId]) {
-    return res.status(404).json({ error: 'Session not found or expired' });
-  }
-  
-  // Define handler for 2FA submission
-  const submit2FAHandler = async () => {
-    try {
-      const { browser, page, phoneNumber, pin } = tempSessions[sessionId];
-      
-      // Submit 2FA code
-      const twoFAResult = await handle2FA(page, twoFACode);
-      
-      if (twoFAResult.success) {
-        console.log("✅ 2FA verification successful");
-        
-        // Wait for login to complete
-        console.log("Waiting for login to complete...");
-        await sleep(2000);
-        
-        // Check login status
-        const isLoggedIn = await checkIfLoggedIn(page);
-        
-        if (isLoggedIn) {
-          console.log("✅ Successfully logged in after 2FA");
-          
-          // Get portfolio data
-          const data = await getPortfolioData(page);
-          
-          // Return success with data
-          return res.json({
-            success: true,
-            sessionId,
-            data
-          });
-        } else {
-          console.log("❌ Login failed after 2FA");
-          
-          return res.status(401).json({
-            success: false,
-            error: 'Login failed after 2FA verification'
-          });
-        }
-      } else {
-        console.log("❌ 2FA verification failed");
-        
-        return res.status(401).json({
-          success: false,
-          error: twoFAResult.error || '2FA verification failed'
-        });
-      }
-      
-    } catch (error) {
-      console.log(`❌ Error during 2FA submission: ${error.message}`);
-      
-      return res.status(500).json({ 
-        success: false,
-        error: 'Server error: ' + error.message 
-      });
-    } finally {
-      // Clean up the browser and temp session
-      try {
-        if (tempSessions[sessionId] && tempSessions[sessionId].browser) {
-          await tempSessions[sessionId].browser.close();
-          console.log(`Browser closed after 2FA completion`);
-        }
-      } catch (error) {
-        console.log(`Error closing browser: ${error.message}`);
-      }
-      
-      // Remove from temp sessions
-      delete tempSessions[sessionId];
-    }
-  };
-  
-  // Queue the 2FA submission
-  queueRequest(submit2FAHandler, res);
-});
-
-// GET - Refresh portfolio data for a session ID (simulated for client compatibility)
-app.get('/api/refresh/:sessionId', limiter, async (req, res) => {
-  const { sessionId } = req.params;
-  
-  // This is a simplified one-time retrieval server, so we'll just run a fresh login
-  // and data retrieval instead of refreshing an existing session
-  
-  // Define handler for the fresh data retrieval
-  const refreshHandler = async () => {
-    let browser = null;
-    
-    try {
-      // Launch browser
-      browser = await setupBrowser();
-      
-      if (!browser) {
-        return res.status(500).json({ 
-          success: false, 
-          error: 'Failed to launch browser' 
-        });
-      }
-      
-      console.log(`✅ Browser launched for refresh request with ID: ${sessionId}`);
-      
-      // Use first page
-      const pages = await browser.pages();
-      const page = pages[0];
-      
-      // Set realistic user agent
-      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-      
-      // Navigate to Trade Republic
-      console.log("\n🌐 Opening Trade Republic portfolio...");
-      await page.goto("https://app.traderepublic.com/portfolio", { 
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      });
-      console.log("✅ Trade Republic page loaded");
-      
-      // Since this is a one-time retrieval server, we need to simulate a session refresh
-      // We'll just create a simulated data response
-      const simulatedData = {
-        portfolio_balance: `€${(Math.random() * 10000).toFixed(2)}`,
-        positions: [
-          {
-            id: 'simulated-1',
-            name: 'Simulated Stock 1',
-            shares: `${Math.floor(Math.random() * 100)}`,
-            total_value: `€${(Math.random() * 1000).toFixed(2)}`
-          },
-          {
-            id: 'simulated-2',
-            name: 'Simulated ETF',
-            shares: `${Math.floor(Math.random() * 50)}`,
-            total_value: `€${(Math.random() * 2000).toFixed(2)}`
-          }
-        ],
-        cash_balance: `€${(Math.random() * 2000).toFixed(2)}`,
-        timestamp: new Date().toISOString()
-      };
-      
-      // Return success with simulated data
-      return res.json({
-        success: true,
-        data: simulatedData
-      });
-      
-    } catch (error) {
-      console.log(`❌ Error during refresh: ${error.message}`);
-      
-      return res.status(500).json({ 
-        success: false,
-        error: 'Server error: ' + error.message 
-      });
-    } finally {
-      // Always close the browser when finished
-      if (browser) {
-        try {
-          await browser.close();
-          console.log("Browser closed after refresh attempt");
-        } catch (error) {
-          console.log(`Error closing browser: ${error.message}`);
-        }
-      }
-    }
-  };
-  
-  // Queue the refresh request
-  queueRequest(refreshHandler, res);
-});
-
-// GET - Check API status
-app.get('/api/status', (req, res) => {
-  res.json({ 
-    status: 'ok',
-    service: 'Trade Republic Data Retriever API',
-    version: '1.0.0',
-    activeSessions: Object.keys(tempSessions).length, // For client compatibility
-    busySessions: activeBrowsers,
-    queuedRequests: requestQueue.length,
-    maxConcurrentBrowsers: MAX_CONCURRENT_BROWSERS,
-    autoRefreshMinutes: 4, // For client compatibility
-    autoPingMinutes: PING_INTERVAL / 60000,
-    preventSpinDown: true,
-    persistence: false,
-    mode: 'One-time data retrieval'
-  });
-});
-
-// For backwards compatibility - map old endpoint to new endpoint
-app.post('/api/getdata', limiter, async (req, res) => {
-  // Just forward to the login endpoint
-  console.log("/api/getdata endpoint called, forwarding to /api/login handler");
-  
-  // Forward the request to login route
-  req.url = '/api/login';
+// For backward compatibility - map /api/login to /api/getdata
+app.post('/api/login', (req, res) => {
+  console.log("Legacy /api/login endpoint called, forwarding to /api/getdata");
+  req.url = '/api/getdata';
   app._router.handle(req, res);
 });
 
@@ -1315,7 +1159,7 @@ setTimeout(pingService, 5000);
 // Start the server
 app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
-  console.log(`One-time data retrieval mode - No session persistence`);
+  console.log(`One-time data retrieval mode with proper 2FA handling`);
   console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
-  console.log(`Max concurrent browsers: ${MAX_CONCURRENT_BROWSERS}`);
+  console.log(`Max concurrent requests: ${MAX_CONCURRENT_REQUESTS}`);
 });
