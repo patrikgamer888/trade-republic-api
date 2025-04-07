@@ -102,7 +102,7 @@ app.use((req, res, next) => {
 // Simple queue system for managing concurrent requests
 const requestQueue = [];
 let activeRequests = 0;
-const MAX_CONCURRENT_REQUESTS = 3; // Increased for better throughput
+const MAX_CONCURRENT_REQUESTS = 2;
 
 // Process queue function
 function processQueue() {
@@ -173,19 +173,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Fast typing function - instant typing with no delay
+// Fast typing function
 async function fastType(page, selector, text) {
   logDebug(`Typing into ${selector}...`);
   await page.focus(selector);
-  await page.evaluate((selector, text) => {
-    const input = document.querySelector(selector);
-    if (input) input.value = text;
-  }, selector, text);
+  await page.keyboard.type(text, {delay: 0});
   logDebug("Typing complete");
 }
 
-// Wait for element function with shorter timeouts
-async function waitForElement(page, selector, timeout = 3000, description = "element") {
+// Wait for element function
+async function waitForElement(page, selector, timeout = 5000, description = "element") {
   try {
     logDebug(`Looking for: ${description}`);
     const element = await page.waitForSelector(selector, { 
@@ -206,7 +203,7 @@ async function waitForElement(page, selector, timeout = 3000, description = "ele
   }
 }
 
-// Setup browser - optimized for speed
+// Setup browser
 async function setupBrowser() {
   console.log("Setting up browser in headless mode...");
   
@@ -218,18 +215,9 @@ async function setupBrowser() {
         '--disable-setuid-sandbox',
         '--no-sandbox',
         '--disable-gpu',
-        '--disable-extensions',
-        '--disable-audio-output',
         '--window-size=1200,800',
         '--incognito',
-        '--no-zygote', 
-        '--no-first-run',
-        '--disable-features=site-per-process',
-        '--disable-dev-tools',
-        '--disable-ipc-flooding-protection',
-        '--disable-backgrounding-occluded-windows'
       ],
-      ignoreHTTPSErrors: true,
       defaultViewport: null
     });
     
@@ -255,15 +243,18 @@ async function setupBrowser() {
 
 // ===== TRADE REPUBLIC FUNCTIONS =====
 
-// Check if already logged in - fast version
+// Check if already logged in
 async function checkIfLoggedIn(page) {
   try {
+    logDebug("Checking login status...");
+    
     // Check URL first (most reliable indicator)
     const currentUrl = await page.url();
     if (currentUrl.includes('/portfolio') || 
         currentUrl.includes('/dashboard') || 
         currentUrl.includes('/timeline') ||
         currentUrl.includes('/profile')) {
+      logDebug("✅ Already logged in (based on URL)");
       return true;
     }
     
@@ -273,35 +264,48 @@ async function checkIfLoggedIn(page) {
     });
     
     if (hasPhoneInput) {
+      logDebug("❌ Found phone number input - not logged in");
       return false;
     }
     
-    // Quick check for portfolio elements
-    const isLoggedIn = await page.evaluate(() => {
-      const selectors = [
-        ".currencyStatus",
-        ".portfolioInstrumentList",
-        "[class*='portfolioValue']",
-        "[class*='dashboard']",
-        "[class*='portfolio']"
-      ];
-      
-      for (const selector of selectors) {
-        const el = document.querySelector(selector);
-        if (el) return true;
-      }
-      
-      return false;
-    });
+    // Now check for logged in indicators
+    const loggedInIndicators = [
+      ".currencyStatus",
+      ".portfolioInstrumentList",
+      "[class*='portfolioValue']",
+      "[class*='dashboard']",
+      "[class*='portfolio']",
+      "[class*='cashAccount']"
+    ];
     
-    return isLoggedIn;
+    for (const selector of loggedInIndicators) {
+      try {
+        const element = await page.$(selector);
+        if (element) {
+          const isVisible = await page.evaluate(el => {
+            const style = window.getComputedStyle(el);
+            return style && style.display !== 'none' && style.visibility !== 'hidden';
+          }, element);
+          
+          if (isVisible) {
+            logDebug("✅ Already logged in");
+            return true;
+          }
+        }
+      } catch (error) {
+        continue;
+      }
+    }
+    
+    logDebug("No login indicators found");
+    return false;
   } catch (error) {
     console.log(`Error checking login status: ${error.message}`);
     return false;
   }
 }
 
-// Handle cookie consent - reliable version
+// Handle cookie consent
 async function handleCookieConsent(page) {
   try {
     logDebug("Checking for cookie consent dialog...");
@@ -320,7 +324,6 @@ async function handleCookieConsent(page) {
           logDebug(`Found cookie button: ${selector}`);
           await cookieButton.click();
           logDebug("✅ Accepted cookies");
-          await sleep(300);
           return true;
         }
       } catch (error) {
@@ -336,7 +339,7 @@ async function handleCookieConsent(page) {
   }
 }
 
-// Enter phone number - reliable version
+// Enter phone number
 async function enterPhoneNumber(page, phoneNumber) {
   try {
     logDebug("Starting phone number entry...");
@@ -360,9 +363,9 @@ async function enterPhoneNumber(page, phoneNumber) {
       if (input) input.value = '';
     });
     
-    // Type phone number normally
+    // Fast type phone number - no delays
     console.log(`Entering phone number: ${phoneNumber.substring(0, 2)}***`);
-    await page.type("#loginPhoneNumber__input", phoneNumber, { delay: 50 });
+    await fastType(page, "#loginPhoneNumber__input", phoneNumber);
     
     // Try to find next button
     logDebug("Looking for next button...");
@@ -408,7 +411,7 @@ async function enterPhoneNumber(page, phoneNumber) {
   }
 }
 
-// Enter PIN - reliable version
+// Enter PIN
 async function enterPIN(page, pin) {
   try {
     logDebug("Starting PIN entry...");
@@ -420,18 +423,18 @@ async function enterPIN(page, pin) {
     logDebug("Looking for PIN input fields...");
     
     // First try with specific class
-    let pinInputs = await page.$('fieldset#loginPin__input input.codeInput__character[type="password"]');
+    let pinInputs = await page.$$('fieldset#loginPin__input input.codeInput__character[type="password"]');
     
     // If not found, try more generic selector
     if (!pinInputs || pinInputs.length === 0) {
       logDebug("Trying alternative PIN selector...");
-      pinInputs = await page.$('#loginPin__input input[type="password"]');
+      pinInputs = await page.$$('#loginPin__input input[type="password"]');
     }
     
     // Last resort - try any password input
     if (!pinInputs || pinInputs.length === 0) {
       logDebug("Trying any password input as last resort...");
-      pinInputs = await page.$('input[type="password"]');
+      pinInputs = await page.$$('input[type="password"]');
     }
     
     logDebug(`Found ${pinInputs.length} PIN input fields`);
@@ -441,16 +444,16 @@ async function enterPIN(page, pin) {
       return false;
     }
     
-    // Enter all digits with a small delay
+    // Enter all digits rapidly
     if (pinInputs.length === 1) {
       // If only one input field for all digits
-      await pinInputs[0].type(pin, {delay: 50});
+      await pinInputs[0].type(pin, {delay: 0});
     } else {
-      // Enter each digit
+      // Enter each digit much faster
       for (let i = 0; i < pin.length && i < pinInputs.length; i++) {
-        // Focus and type
+        // Focus and type rapidly
         await pinInputs[i].click();
-        await pinInputs[i].type(pin[i], {delay: 50});
+        await pinInputs[i].type(pin[i], {delay: 0});
       }
     }
     
@@ -458,7 +461,7 @@ async function enterPIN(page, pin) {
     
     // Wait for PIN processing but reduced time
     logDebug("Waiting for PIN processing...");
-    await sleep(1000);
+    await sleep(1500);
     
     return true;
   } catch (error) {
@@ -467,69 +470,60 @@ async function enterPIN(page, pin) {
   }
 }
 
-// Handle 2FA - optimized version
+// Handle 2FA
 async function handle2FA(page, twoFACode) {
   try {
-    // Check for 2FA input fields directly
+    logDebug("Checking if 2FA is required...");
+    
+    // Check for 2FA input
     const is2FARequired = await page.evaluate(() => {
       return !!document.querySelector('#smsCode__input') || 
              !!document.querySelector('[class*="smsCode"]');
     });
     
     if (!is2FARequired) {
+      logDebug("No 2FA required");
       return { success: true, needs2FA: false };
     }
     
     console.log("📱 2FA authentication required");
     
     if (!twoFACode) {
+      console.log("No 2FA code provided, client needs to submit code");
       return { success: false, needs2FA: true };
     }
     
-    // Enter 2FA code using direct DOM manipulation for speed
-    const codeEntered = await page.evaluate((code) => {
-      try {
-        // Find SMS input fields
-        const inputs = document.querySelectorAll('#smsCode__input input');
-        
-        if (inputs.length === 0) {
-          return false;
-        }
-        
-        // Single input field
-        if (inputs.length === 1) {
-          inputs[0].value = code;
-          const event = new Event('input', { bubbles: true });
-          inputs[0].dispatchEvent(event);
-          return true;
-        }
-        
-        // Multiple input fields
-        for (let i = 0; i < code.length && i < inputs.length; i++) {
-          inputs[i].value = code[i];
-          const event = new Event('input', { bubbles: true });
-          inputs[i].dispatchEvent(event);
-          
-          // Simulate focus on next field
-          if (i < inputs.length - 1) {
-            inputs[i+1].focus();
-          }
-        }
-        
-        return true;
-      } catch (e) {
-        return false;
-      }
-    }, twoFACode);
+    // Wait for SMS code field
+    const smsField = await waitForElement(page, "#smsCode__input", 5000, "2FA input field");
     
-    if (!codeEntered) {
-      return { success: false, needs2FA: true, error: "Failed to enter 2FA code" };
+    if (!smsField) {
+      console.log("❌ 2FA input field not found");
+      return { success: false, needs2FA: true, error: "2FA input field not found" };
     }
     
-    console.log("✅ 2FA code entered");
+    // Find SMS input fields
+    const smsInputs = await page.$$('#smsCode__input input');
     
-    // Brief wait for 2FA processing
-    await sleep(500);
+    if (smsInputs.length === 0) {
+      console.log("❌ No 2FA input fields found");
+      return { success: false, needs2FA: true, error: "No 2FA input fields found" };
+    }
+    
+    // Enter SMS code instantly
+    if (smsInputs.length === 1) {
+      // Single input field - paste entire code
+      await smsInputs[0].type(twoFACode, {delay: 0});
+    } else {
+      // Multiple input fields (one per digit) - type rapidly
+      for (let i = 0; i < twoFACode.length && i < smsInputs.length; i++) {
+        await smsInputs[i].type(twoFACode[i], {delay: 0});
+      }
+    }
+    
+    logDebug("✅ 2FA code entered");
+    
+    // Brief wait for processing
+    await sleep(1000);
     
     return { success: true, needs2FA: false };
   } catch (error) {
@@ -538,7 +532,7 @@ async function handle2FA(page, twoFACode) {
   }
 }
 
-// Login to Trade Republic - optimized version
+// Login to Trade Republic
 async function loginToTradeRepublic(page, credentials) {
   try {
     console.log("\n📱 Starting Trade Republic login process...");
@@ -546,48 +540,53 @@ async function loginToTradeRepublic(page, credentials) {
     const { phoneNumber, pin, twoFACode } = credentials;
     
     if (!phoneNumber || !pin) {
+      console.log("❌ Missing required credentials");
       return { success: false, error: "Missing credentials" };
     }
+    
+    console.log(`Using phone number: ${phoneNumber.substring(0, 2)}***`);
     
     // Check if already logged in
     if (await checkIfLoggedIn(page)) {
       return { success: true };
     }
     
-    // Handle cookie consent
+    // Handle cookie consent if present
     await handleCookieConsent(page);
     
-    // Enter phone number
+    // Enter phone number and proceed
     const phoneSuccess = await enterPhoneNumber(page, phoneNumber);
     
     if (!phoneSuccess) {
+      console.log("❌ Failed during phone number entry");
       return { success: false, error: "Failed during phone number entry" };
     }
     
-    // Minimum wait for page transition
-    await sleep(300);
-    
-    // Enter PIN
+    // Enter PIN code
     const pinSuccess = await enterPIN(page, pin);
     
     if (!pinSuccess) {
+      console.log("❌ Failed during PIN entry");
       return { success: false, error: "Failed during PIN entry" };
     }
     
-    // Brief wait for PIN processing
-    await sleep(500);
-    
-    // Handle 2FA if provided
+    // Handle 2FA if needed
     const twoFAResult = await handle2FA(page, twoFACode);
     
     if (twoFAResult.needs2FA) {
-      return { success: false, needs2FA: true, error: "2FA code required" };
+      console.log("2FA required but not completed");
+      return { 
+        success: false, 
+        needs2FA: true, 
+        error: "2FA code required" 
+      };
     }
     
-    // Quick wait for login completion
-    await sleep(1000);
+    // Wait for login to complete
+    console.log("Waiting for login to complete...");
+    await sleep(2000);
     
-    // Verify login
+    // Final check to verify login success
     const isLoggedIn = await checkIfLoggedIn(page);
     
     if (isLoggedIn) {
@@ -595,7 +594,11 @@ async function loginToTradeRepublic(page, credentials) {
       return { success: true };
     } else {
       console.log("❌ Login verification failed");
-      return { success: false, error: "Login verification failed" };
+      console.log("Current URL: " + await page.url());
+      return { 
+        success: false, 
+        error: "Login verification failed" 
+      };
     }
   } catch (error) {
     console.log(`❌ Login process error: ${error.message}`);
@@ -603,58 +606,88 @@ async function loginToTradeRepublic(page, credentials) {
   }
 }
 
-// Function to click dropdown - optimized
+// Function to click dropdown
 async function clickSinceBuyEuroOption(page) {
   try {
-    // Execute in page context for speed
-    return await page.evaluate(() => {
-      try {
-        // Click dropdown button
-        const dropdownButton = document.querySelector(".dropdownList__openButton");
-        if (!dropdownButton) return false;
-        
-        dropdownButton.click();
-        
-        // Small timeout to wait for dropdown to open
-        setTimeout(() => {
-          try {
-            // Try direct ID first
-            let option = document.querySelector("#investments-sinceBuyabs");
-            if (option) {
-              option.click();
-              return true;
-            }
-            
-            // Try by text content
-            const paragraphs = document.querySelectorAll('p.dropdownList__optionName');
-            for (let i = 0; i < paragraphs.length; i++) {
-              const p = paragraphs[i];
-              if (p.textContent.includes('Since buy') && p.textContent.includes('€')) {
-                const li = p.closest('li');
-                if (li) {
-                  li.click();
-                  return true;
-                }
+    console.log("\n🔄 Setting view to 'Since buy (€)'...");
+    
+    // Find and click dropdown button
+    console.log("Looking for dropdown button...");
+    const dropdownButtonSelector = ".dropdownList__openButton";
+    try {
+      await page.click(dropdownButtonSelector);
+      console.log("✅ Clicked dropdown button");
+    } catch (clickError) {
+      console.log(`❌ Failed to click dropdown button: ${clickError.message}`);
+      return false;
+    }
+    
+    // Brief wait for dropdown to appear
+    await sleep(500);
+    
+    // Try multiple selection methods in sequence
+    const selectionMethods = [
+      // Direct click by ID
+      async () => {
+        logDebug("Trying to click by ID...");
+        await page.click("#investments-sinceBuyabs");
+        return true;
+      },
+      
+      // Try by paragraph class
+      async () => {
+        logDebug("Trying by paragraph class...");
+        const found = await page.evaluate(() => {
+          const paragraphs = document.querySelectorAll('p.dropdownList__optionName');
+          for (let i = 0; i < paragraphs.length; i++) {
+            const p = paragraphs[i];
+            if (p.textContent.includes('Since buy') && p.textContent.includes('€')) {
+              const li = p.closest('li');
+              if (li) {
+                li.click();
+                return true;
               }
             }
-            
-            return false;
-          } catch (e) {
-            return false;
           }
-        }, 300);
-        
-        return true;
-      } catch (e) {
+          return false;
+        });
+        return found;
+      },
+      
+      // Try direct XPath
+      async () => {
+        logDebug("Trying XPath method...");
+        const [element] = await page.$x("//p[contains(text(), 'Since buy') and contains(text(), '€')]/ancestor::li");
+        if (element) {
+          await element.click();
+          return true;
+        }
         return false;
       }
-    });
+    ];
+    
+    // Try each method until one works
+    for (const method of selectionMethods) {
+      try {
+        if (await method()) {
+          console.log("✅ Selected 'Since buy (€)' option");
+          await sleep(500);
+          return true;
+        }
+      } catch (error) {
+        continue;
+      }
+    }
+    
+    console.log("❌ Could not find or click 'Since buy (€)' option");
+    return false;
   } catch (error) {
+    console.log(`Error setting view: ${error.message}`);
     return false;
   }
 }
 
-// Get portfolio data - optimized for speed
+// Get portfolio data
 async function getPortfolioData(page) {
   const data = {
     portfolio_balance: "Not available",
@@ -666,186 +699,219 @@ async function getPortfolioData(page) {
   try {
     console.log("\n📊 Fetching portfolio data...");
     
-    // Get everything in parallel for speed
-    await Promise.all([
-      // Get portfolio balance
-      (async () => {
-        try {
-          data.portfolio_balance = await page.evaluate(() => {
-            const selectors = [
-              ".currencyStatus span[role='status']", 
-              "[class*='portfolioValue']",
-              "[class*='portfolioBalance']"
-            ];
-            
-            for (const selector of selectors) {
-              const el = document.querySelector(selector);
-              if (el) return el.textContent.trim();
-            }
-            
-            return "Not available";
-          });
-          
+    // Get portfolio balance
+    try {
+      const balanceSelectors = [
+        ".currencyStatus span[role='status']", 
+        "[class*='portfolioValue']",
+        "[class*='portfolioBalance']"
+      ];
+      
+      for (const selector of balanceSelectors) {
+        const balanceElement = await page.$(selector);
+        if (balanceElement) {
+          data.portfolio_balance = await page.evaluate(el => el.textContent.trim(), balanceElement);
           console.log(`💰 Portfolio balance: ${data.portfolio_balance}`);
-        } catch (error) {
-          console.log(`Error getting portfolio balance: ${error.message}`);
+          break;
         }
-      })(),
+      }
+    } catch (error) {
+      console.log(`Error getting portfolio balance: ${error.message}`);
+    }
+    
+    // Set view to show "Since buy (€)"
+    console.log("\nSetting view to show Euro values...");
+    await clickSinceBuyEuroOption(page);
+    
+    // Get all position data
+    try {
+      console.log("Looking for portfolio positions...");
       
-      // Set view to Euro values and get positions
-      (async () => {
-        try {
-          // Try to set view (not critical if it fails)
-          await clickSinceBuyEuroOption(page);
+      // Wait for portfolio list to become available
+      await sleep(1500);
+      
+      // Get all position data with multiple selector attempts
+      const positions = await page.evaluate(() => {
+        const results = [];
+        
+        // Try multiple selectors for the portfolio list
+        const possibleListSelectors = [
+          'ul.portfolioInstrumentList',
+          '[class*="portfolioInstrumentList"]',
+          '[class*="positionsList"]',
+          '[class*="instrumentList"]',
+          'ul[class*="portfolio"]'
+        ];
+        
+        let list = null;
+        let items = [];
+        
+        // Try each selector until we find a list
+        for (const selector of possibleListSelectors) {
+          list = document.querySelector(selector);
+          if (list) {
+            console.log(`Found list with selector: ${selector}`);
+            items = list.querySelectorAll('li');
+            if (items.length > 0) break;
+          }
+        }
+        
+        // If we still don't have items, try a more generic approach
+        if (items.length === 0) {
+          console.log("Trying generic approach to find positions");
+          items = document.querySelectorAll('[class*="instrumentListItem"], [class*="positionItem"]');
+        }
+        
+        console.log(`Found ${items.length} potential position items`);
+        
+        // Process each position with multiple possible selectors
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const id = item.id || `position-${i}`;
           
-          // Get positions with a more efficient approach
-          const positions = await page.evaluate(() => {
-            const results = [];
-            
-            // Try to find the list of positions
-            const selectors = [
-              'ul.portfolioInstrumentList',
-              '[class*="portfolioInstrumentList"]',
-              '[class*="positionsList"]',
-              '[class*="instrumentList"]'
-            ];
-            
-            let items = [];
-            
-            // Try each selector to find items
-            for (const selector of selectors) {
-              const list = document.querySelector(selector);
-              if (list) {
-                items = list.querySelectorAll('li');
-                if (items.length > 0) break;
-              }
-            }
-            
-            // If nothing found, try a generic approach
-            if (items.length === 0) {
-              items = document.querySelectorAll('[class*="instrumentListItem"], [class*="positionItem"]');
-            }
-            
-            // Process each position
-            for (let i = 0; i < items.length; i++) {
-              const item = items[i];
-              
-              // Get name, value, and shares
-              let name = "Unknown";
-              let value = "Unknown";
-              let shares = "Unknown";
-              
-              // Get name
-              const nameElement = item.querySelector('[class*="instrumentName"], [class*="positionName"], [class*="instrumentTitle"]');
-              if (nameElement) name = nameElement.textContent.trim();
-              
-              // Get value
-              const valueElement = item.querySelector('[class*="currentPrice"], [class*="positionValue"], [class*="instrumentValue"]');
-              if (valueElement) value = valueElement.textContent.trim();
-              
-              // Get shares
-              const sharesElement = item.querySelector('[class*="sharesTag"], [class*="positionQuantity"], [class*="shares"]');
-              if (sharesElement) shares = sharesElement.textContent.trim();
-              
-              // Only add if we have meaningful data
-              if (name !== "Unknown" || value !== "Unknown") {
-                results.push({
-                  id: `position-${i}`,
-                  name,
-                  shares,
-                  total_value: value
-                });
-              }
-            }
-            
-            return results;
-          });
+          // Try multiple selectors for name
+          const nameSelectors = [
+            '.instrumentListItem__name',
+            '[class*="instrumentName"]',
+            '[class*="positionName"]',
+            '[class*="instrumentTitle"]'
+          ];
           
-          console.log(`Found ${positions.length} positions`);
+          // Try multiple selectors for price
+          const priceSelectors = [
+            '.instrumentListItem__currentPrice',
+            '[class*="currentPrice"]',
+            '[class*="positionValue"]',
+            '[class*="instrumentValue"]'
+          ];
           
-          if (positions.length > 0) {
-            data.positions = positions;
-          } else {
-            // Try once more if no positions found
-            await sleep(1000);
-            
-            // Same code but in a second attempt
-            const retryPositions = await page.evaluate(() => {
-              const results = [];
-              
-              // Try more generic selectors for the retry
-              const items = document.querySelectorAll('li, [class*="instrumentListItem"], [class*="positionItem"]');
-              
-              // Process each position
-              for (let i = 0; i < items.length; i++) {
-                const item = items[i];
-                const text = item.textContent.trim();
-                
-                // Only add if it looks like it might be a position
-                if (text && text.length > 5 && !text.includes("No positions")) {
-                  results.push({
-                    id: `retry-position-${i}`,
-                    name: text.substring(0, 30),
-                    shares: "Unknown",
-                    total_value: "Unknown"
-                  });
-                }
-              }
-              
-              return results;
+          // Try multiple selectors for shares
+          const sharesSelectors = [
+            '.tag.instrumentListItem__sharesTag',
+            '[class*="sharesTag"]',
+            '[class*="positionQuantity"]',
+            '[class*="shares"]'
+          ];
+          
+          // Find elements with potential selectors
+          let nameElement = null;
+          for (const selector of nameSelectors) {
+            nameElement = item.querySelector(selector);
+            if (nameElement) break;
+          }
+          
+          let priceElement = null;
+          for (const selector of priceSelectors) {
+            priceElement = item.querySelector(selector);
+            if (priceElement) break;
+          }
+          
+          let sharesElement = null;
+          for (const selector of sharesSelectors) {
+            sharesElement = item.querySelector(selector);
+            if (sharesElement) break;
+          }
+          
+          // Extract text values
+          const name = nameElement ? nameElement.textContent.trim() : "Unknown";
+          const value = priceElement ? priceElement.textContent.trim() : "Unknown";
+          const shares = sharesElement ? sharesElement.textContent.trim() : "Unknown";
+          
+          // Only add to results if we have meaningful data
+          if (name !== "Unknown" || value !== "Unknown") {
+            results.push({
+              id,
+              name,
+              shares,
+              total_value: value
             });
-            
-            if (retryPositions && retryPositions.length > 0) {
-              console.log(`Second attempt found ${retryPositions.length} positions`);
-              data.positions = retryPositions;
-            }
           }
-        } catch (error) {
-          console.log(`Error getting positions: ${error.message}`);
         }
-      })(),
+        
+        return results;
+      });
       
-      // Get cash balance
-      (async () => {
-        try {
-          // Try to get cash balance from the current page first
-          data.cash_balance = await page.evaluate(() => {
-            const cashElement = document.querySelector('.cashBalance__amount, [class*="cashBalance"]');
-            return cashElement ? cashElement.textContent.trim() : null;
-          });
+      console.log(`Found ${positions.length} positions`);
+      
+      if (positions.length === 0) {
+        console.log("⚠️ No positions found. Waiting longer and trying one more time...");
+        await sleep(3000);
+        
+        // One more attempt with forced page reload
+        await page.reload({ waitUntil: 'networkidle2' });
+        await sleep(3000);
+        
+        const retryPositions = await page.evaluate(() => {
+          // Same logic as above, but simplified for brevity
+          const results = [];
+          const items = document.querySelectorAll('[class*="instrumentListItem"], [class*="positionItem"], li');
           
-          // If we couldn't find it, try navigating to transactions page
-          if (!data.cash_balance) {
-            // Find transactions link
-            const transactionsLink = await page.$('a.navigationItem__link[href="/profile/transactions"]');
-            
-            if (transactionsLink) {
-              await transactionsLink.click();
-              await sleep(500);
-              
-              data.cash_balance = await page.evaluate(() => {
-                const cashElement = document.querySelector('.cashBalance__amount, [class*="cashBalance"]');
-                return cashElement ? cashElement.textContent.trim() : "Not available";
-              });
-              
-              if (data.cash_balance) {
-                console.log(`💰 Cash balance: ${data.cash_balance}`);
-              }
-              
-              // Go back to portfolio
-              await page.goto("https://app.traderepublic.com/portfolio", { 
-                waitUntil: 'domcontentloaded',
-                timeout: 5000
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            // Extract basic info
+            const name = item.textContent.trim();
+            if (name && name.length > 0 && !name.includes("No positions")) {
+              results.push({
+                id: `retry-${i}`,
+                name: name.substring(0, 30), // Take first 30 chars as name
+                shares: "Unknown",
+                total_value: "Unknown"
               });
             }
-          } else {
-            console.log(`💰 Cash balance: ${data.cash_balance}`);
           }
-        } catch (error) {
-          console.log(`Error getting cash balance: ${error.message}`);
+          return results;
+        });
+        
+        if (retryPositions.length > 0) {
+          console.log(`Second attempt found ${retryPositions.length} positions`);
+          data.positions = retryPositions;
         }
-      })()
-    ]);
+      } else {
+        // Add positions to data
+        positions.forEach((pos, index) => {
+          logDebug(`📊 Position ${index+1}: ${pos.name} (${pos.id})`);
+          logDebug(`   Shares: ${pos.shares}`);
+          logDebug(`   Value: ${pos.total_value}`);
+          data.positions.push(pos);
+        });
+      }
+      
+    } catch (error) {
+      console.log(`Error getting positions: ${error.message}`);
+    }
+    
+    // Get cash balance by navigating to transactions page
+    try {
+      console.log("\n💵 Looking for cash balance...");
+      
+      // Navigate to transactions page
+      console.log("Navigating to transactions page...");
+      
+      // Find the transactions link
+      const transactionsLink = await page.$('a.navigationItem__link[href="/profile/transactions"]');
+      
+      if (transactionsLink) {
+        // Click the link
+        await transactionsLink.click();
+        console.log("Clicked transactions link");
+        
+        // Brief wait for page to load
+        await sleep(1000);
+        
+        // Find the cash balance element
+        const cashBalanceElement = await page.$('.cashBalance__amount');
+        if (cashBalanceElement) {
+          data.cash_balance = await page.evaluate(el => el.textContent.trim(), cashBalanceElement);
+          console.log(`💰 Cash balance: ${data.cash_balance}`);
+        } else {
+          console.log("Cash balance element not found on transactions page");
+        }
+      } else {
+        console.log("Could not find transactions link");
+      }
+    } catch (error) {
+      console.log(`Error getting cash balance: ${error.message}`);
+    }
     
     return data;
   } catch (error) {
@@ -870,8 +936,8 @@ app.get('/api/ping', (req, res) => {
 app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
-    service: 'Trade Republic Fast Data API',
-    version: '1.1.0',
+    service: 'Trade Republic One-Time Data API',
+    version: '1.0.0',
     activeRequests,
     queuedRequests: requestQueue.length,
     pendingSessions: pendingSessions.size,
@@ -921,8 +987,11 @@ app.post('/api/getdata', limiter, async (req, res) => {
               if (twoFAResult.success) {
                 console.log("✅ 2FA verification successful");
                 
-                // Quick verification
-                await sleep(1000);
+                // Wait for login to complete
+                console.log("Waiting for login to complete...");
+                await sleep(2000);
+                
+                // Final check to verify login success
                 const isLoggedIn = await checkIfLoggedIn(page);
                 
                 if (isLoggedIn) {
@@ -977,10 +1046,8 @@ app.post('/api/getdata', limiter, async (req, res) => {
       // This is either a new request or no matching pending session was found
       // Start a fresh login process
       
-      // Launch browser with optimized settings
-      const startTime = Date.now();
+      // Launch browser
       browser = await setupBrowser();
-      console.log(`Browser launched in ${Date.now() - startTime}ms`);
       
       if (!browser) {
         return res.status(500).json({
@@ -989,22 +1056,20 @@ app.post('/api/getdata', limiter, async (req, res) => {
         });
       }
       
-      // Get first page and pre-configure
+      console.log("✅ Browser launched");
+      
+      // Get first page
       const pages = await browser.pages();
       const page = pages[0];
       
-      // Set user agent and other optimizations
-      // Configure page with basic settings
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setDefaultNavigationTimeout(15000);
-    
-    // Note: Disabling request interception as it might cause issues
+      // Set user agent
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
       
       // Navigate to Trade Republic
       console.log("\n🌐 Opening Trade Republic portfolio...");
       await page.goto("https://app.traderepublic.com/portfolio", { 
-        waitUntil: 'domcontentloaded', // Faster than networkidle2
-        timeout: 15000
+        waitUntil: 'networkidle2',
+        timeout: 30000
       });
       console.log("✅ Trade Republic page loaded");
       
@@ -1016,10 +1081,6 @@ app.post('/api/getdata', limiter, async (req, res) => {
         
         // Get portfolio data
         const data = await getPortfolioData(page);
-        
-        // Close browser after getting data
-        await browser.close();
-        browser = null;
         
         // Return success with data
         return res.json({
@@ -1044,7 +1105,7 @@ app.post('/api/getdata', limiter, async (req, res) => {
         console.log(`Stored browser session for 2FA. Token: ${token.substring(0, 8)}...`);
         console.log("LEAVING BROWSER OPEN - waiting for 2FA code submission");
         
-        // Set browser to null to prevent it from being closed
+        // Set browser to null to prevent it from being closed in finally block
         browser = null;
         
         // Return needs2FA response
@@ -1098,7 +1159,7 @@ setTimeout(pingService, 5000);
 // Start the server
 app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
-  console.log(`OPTIMIZED for SPEED - One-time data retrieval mode`);
+  console.log(`One-time data retrieval mode with proper 2FA handling`);
   console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
   console.log(`Max concurrent requests: ${MAX_CONCURRENT_REQUESTS}`);
 });
