@@ -301,76 +301,103 @@ async function checkIfLoggedIn(page) {
   }
 }
 
-// Handle cookie consent - fast version
+// Handle cookie consent - reliable version
 async function handleCookieConsent(page) {
   try {
-    // Execute all in page context for speed
-    return await page.evaluate(() => {
-      const cookieSelectors = [
-        "button.buttonBase.consentCard__action.buttonPrimary",
-        ".buttonBase.consentCard__action.buttonPrimary",
-        "[data-testid='cookie-banner-accept']",
-        ".cookie-banner__accept"
-      ];
-      
-      for (const selector of cookieSelectors) {
-        const button = document.querySelector(selector);
-        if (button) {
-          button.click();
+    logDebug("Checking for cookie consent dialog...");
+    
+    const cookieSelectors = [
+      "button.buttonBase.consentCard__action.buttonPrimary",
+      ".buttonBase.consentCard__action.buttonPrimary",
+      "[data-testid='cookie-banner-accept']",
+      ".cookie-banner__accept"
+    ];
+    
+    for (const selector of cookieSelectors) {
+      try {
+        const cookieButton = await page.$(selector);
+        if (cookieButton) {
+          logDebug(`Found cookie button: ${selector}`);
+          await cookieButton.click();
+          logDebug("✅ Accepted cookies");
+          await sleep(300);
           return true;
         }
+      } catch (error) {
+        continue;
       }
-      
-      return false;
-    });
+    }
+    
+    logDebug("No cookie consent dialog found");
+    return false;
   } catch (error) {
+    console.log(`Error handling cookie consent: ${error.message}`);
     return false;
   }
 }
 
-// Enter phone number - fast version
+// Enter phone number - reliable version
 async function enterPhoneNumber(page, phoneNumber) {
   try {
-    // Check for phone field
+    logDebug("Starting phone number entry...");
+    
+    // Wait for phone number field
     const phoneField = await waitForElement(
       page, 
       "#loginPhoneNumber__input", 
-      5000, 
+      10000, 
       "phone number field"
     );
     
     if (!phoneField) {
+      console.log("❌ Phone number field not found");
       return false;
     }
     
-    // Fast type phone number using evaluate (instant)
-    await page.evaluate((phoneNumber) => {
+    // Clear field just in case
+    await page.evaluate(() => {
       const input = document.querySelector("#loginPhoneNumber__input");
-      if (input) input.value = phoneNumber;
-    }, phoneNumber);
-    
-    console.log(`Entered phone number: ${phoneNumber.substring(0, 2)}***`);
-    
-    // Find and click next button
-    const clicked = await page.evaluate(() => {
-      const selectors = [
-        "button.buttonBase.loginPhoneNumber__action.buttonPrimary",
-        ".buttonBase.loginPhoneNumber__action",
-        "[data-testid='login-phone-next']"
-      ];
-      
-      for (const selector of selectors) {
-        const button = document.querySelector(selector);
-        if (button) {
-          button.click();
-          return true;
-        }
-      }
-      
-      return false;
+      if (input) input.value = '';
     });
     
+    // Type phone number normally
+    console.log(`Entering phone number: ${phoneNumber.substring(0, 2)}***`);
+    await page.type("#loginPhoneNumber__input", phoneNumber, { delay: 50 });
+    
+    // Try to find next button
+    logDebug("Looking for next button...");
+    
+    const nextButtonSelectors = [
+      "button.buttonBase.loginPhoneNumber__action.buttonPrimary",
+      ".buttonBase.loginPhoneNumber__action",
+      "[data-testid='login-phone-next']"
+    ];
+    
+    let clicked = false;
+    
+    for (const selector of nextButtonSelectors) {
+      try {
+        // Wait specifically for this button
+        const nextButton = await waitForElement(page, selector, 5000, `next button (${selector})`);
+        
+        if (nextButton) {
+          logDebug(`Clicking next button: ${selector}`);
+          await nextButton.click();
+          
+          logDebug("✅ Clicked next button");
+          clicked = true;
+          
+          // Brief wait for next page to load
+          await sleep(500);
+          break;
+        }
+      } catch (error) {
+        logDebug(`Error with button ${selector}: ${error.message}`);
+      }
+    }
+    
     if (!clicked) {
+      console.log("❌ Could not find or click any next button");
       return false;
     }
     
@@ -381,60 +408,59 @@ async function enterPhoneNumber(page, phoneNumber) {
   }
 }
 
-// Enter PIN - fast version
+// Enter PIN - reliable version
 async function enterPIN(page, pin) {
   try {
-    // Wait briefly for PIN field to appear
-    await sleep(300);
+    logDebug("Starting PIN entry...");
     
-    // Use page.evaluate for speed to handle PIN entry
-    const pinSuccess = await page.evaluate((pin) => {
-      try {
-        // First try specific class
-        let inputs = document.querySelectorAll('fieldset#loginPin__input input.codeInput__character[type="password"]');
-        
-        // If not found, try more generic selector
-        if (!inputs || inputs.length === 0) {
-          inputs = document.querySelectorAll('#loginPin__input input[type="password"]');
-        }
-        
-        // Last resort - try any password input
-        if (!inputs || inputs.length === 0) {
-          inputs = document.querySelectorAll('input[type="password"]');
-        }
-        
-        if (inputs.length === 0) {
-          return false;
-        }
-        
-        // If single input
-        if (inputs.length === 1) {
-          inputs[0].value = pin;
-          const event = new Event('input', { bubbles: true });
-          inputs[0].dispatchEvent(event);
-          return true;
-        }
-        
-        // If multiple inputs (one per digit)
-        for (let i = 0; i < pin.length && i < inputs.length; i++) {
-          inputs[i].value = pin[i];
-          const event = new Event('input', { bubbles: true });
-          inputs[i].dispatchEvent(event);
-          
-          // Simulate focus on next field
-          if (i < inputs.length - 1) {
-            inputs[i+1].focus();
-          }
-        }
-        
-        return true;
-      } catch (e) {
-        console.log("Error in PIN entry:", e);
-        return false;
+    // Brief wait for PIN field to appear
+    await sleep(500);
+    
+    // Try to find PIN input
+    logDebug("Looking for PIN input fields...");
+    
+    // First try with specific class
+    let pinInputs = await page.$('fieldset#loginPin__input input.codeInput__character[type="password"]');
+    
+    // If not found, try more generic selector
+    if (!pinInputs || pinInputs.length === 0) {
+      logDebug("Trying alternative PIN selector...");
+      pinInputs = await page.$('#loginPin__input input[type="password"]');
+    }
+    
+    // Last resort - try any password input
+    if (!pinInputs || pinInputs.length === 0) {
+      logDebug("Trying any password input as last resort...");
+      pinInputs = await page.$('input[type="password"]');
+    }
+    
+    logDebug(`Found ${pinInputs.length} PIN input fields`);
+    
+    if (pinInputs.length === 0) {
+      console.log("❌ No PIN input fields found");
+      return false;
+    }
+    
+    // Enter all digits with a small delay
+    if (pinInputs.length === 1) {
+      // If only one input field for all digits
+      await pinInputs[0].type(pin, {delay: 50});
+    } else {
+      // Enter each digit
+      for (let i = 0; i < pin.length && i < pinInputs.length; i++) {
+        // Focus and type
+        await pinInputs[i].click();
+        await pinInputs[i].type(pin[i], {delay: 50});
       }
-    }, pin);
+    }
     
-    return pinSuccess;
+    logDebug("✅ PIN entry complete");
+    
+    // Wait for PIN processing but reduced time
+    logDebug("Waiting for PIN processing...");
+    await sleep(1000);
+    
+    return true;
   } catch (error) {
     console.log(`Error entering PIN: ${error.message}`);
     return false;
@@ -674,70 +700,65 @@ async function getPortfolioData(page) {
           
           // Get positions with a more efficient approach
           const positions = await page.evaluate(() => {
-            // Function to scrape positions
-            const getPositions = () => {
-              const results = [];
-              
-              // Try to find the list of positions
-              const selectors = [
-                'ul.portfolioInstrumentList',
-                '[class*="portfolioInstrumentList"]',
-                '[class*="positionsList"]',
-                '[class*="instrumentList"]'
-              ];
-              
-              let items = [];
-              
-              // Try each selector to find items
-              for (const selector of selectors) {
-                const list = document.querySelector(selector);
-                if (list) {
-                  items = list.querySelectorAll('li');
-                  if (items.length > 0) break;
-                }
-              }
-              
-              // If nothing found, try a generic approach
-              if (items.length === 0) {
-                items = document.querySelectorAll('[class*="instrumentListItem"], [class*="positionItem"]');
-              }
-              
-              // Process each position
-              for (let i = 0; i < items.length; i++) {
-                const item = items[i];
-                
-                // Get name, value, and shares
-                let name = "Unknown";
-                let value = "Unknown";
-                let shares = "Unknown";
-                
-                // Get name
-                const nameElement = item.querySelector('[class*="instrumentName"], [class*="positionName"], [class*="instrumentTitle"]');
-                if (nameElement) name = nameElement.textContent.trim();
-                
-                // Get value
-                const valueElement = item.querySelector('[class*="currentPrice"], [class*="positionValue"], [class*="instrumentValue"]');
-                if (valueElement) value = valueElement.textContent.trim();
-                
-                // Get shares
-                const sharesElement = item.querySelector('[class*="sharesTag"], [class*="positionQuantity"], [class*="shares"]');
-                if (sharesElement) shares = sharesElement.textContent.trim();
-                
-                // Only add if we have meaningful data
-                if (name !== "Unknown" || value !== "Unknown") {
-                  results.push({
-                    id: `position-${i}`,
-                    name,
-                    shares,
-                    total_value: value
-                  });
-                }
-              }
-              
-              return results;
-            };
+            const results = [];
             
-            return getPositions();
+            // Try to find the list of positions
+            const selectors = [
+              'ul.portfolioInstrumentList',
+              '[class*="portfolioInstrumentList"]',
+              '[class*="positionsList"]',
+              '[class*="instrumentList"]'
+            ];
+            
+            let items = [];
+            
+            // Try each selector to find items
+            for (const selector of selectors) {
+              const list = document.querySelector(selector);
+              if (list) {
+                items = list.querySelectorAll('li');
+                if (items.length > 0) break;
+              }
+            }
+            
+            // If nothing found, try a generic approach
+            if (items.length === 0) {
+              items = document.querySelectorAll('[class*="instrumentListItem"], [class*="positionItem"]');
+            }
+            
+            // Process each position
+            for (let i = 0; i < items.length; i++) {
+              const item = items[i];
+              
+              // Get name, value, and shares
+              let name = "Unknown";
+              let value = "Unknown";
+              let shares = "Unknown";
+              
+              // Get name
+              const nameElement = item.querySelector('[class*="instrumentName"], [class*="positionName"], [class*="instrumentTitle"]');
+              if (nameElement) name = nameElement.textContent.trim();
+              
+              // Get value
+              const valueElement = item.querySelector('[class*="currentPrice"], [class*="positionValue"], [class*="instrumentValue"]');
+              if (valueElement) value = valueElement.textContent.trim();
+              
+              // Get shares
+              const sharesElement = item.querySelector('[class*="sharesTag"], [class*="positionQuantity"], [class*="shares"]');
+              if (sharesElement) shares = sharesElement.textContent.trim();
+              
+              // Only add if we have meaningful data
+              if (name !== "Unknown" || value !== "Unknown") {
+                results.push({
+                  id: `position-${i}`,
+                  name,
+                  shares,
+                  total_value: value
+                });
+              }
+            }
+            
+            return results;
           });
           
           console.log(`Found ${positions.length} positions`);
@@ -746,12 +767,38 @@ async function getPortfolioData(page) {
             data.positions = positions;
           } else {
             // Try once more if no positions found
-            setTimeout(async () => {
-              const retryPositions = await page.evaluate(getPositions);
-              if (retryPositions.length > 0) {
-                data.positions = retryPositions;
+            await sleep(1000);
+            
+            // Same code but in a second attempt
+            const retryPositions = await page.evaluate(() => {
+              const results = [];
+              
+              // Try more generic selectors for the retry
+              const items = document.querySelectorAll('li, [class*="instrumentListItem"], [class*="positionItem"]');
+              
+              // Process each position
+              for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                const text = item.textContent.trim();
+                
+                // Only add if it looks like it might be a position
+                if (text && text.length > 5 && !text.includes("No positions")) {
+                  results.push({
+                    id: `retry-position-${i}`,
+                    name: text.substring(0, 30),
+                    shares: "Unknown",
+                    total_value: "Unknown"
+                  });
+                }
               }
-            }, 1000);
+              
+              return results;
+            });
+            
+            if (retryPositions && retryPositions.length > 0) {
+              console.log(`Second attempt found ${retryPositions.length} positions`);
+              data.positions = retryPositions;
+            }
           }
         } catch (error) {
           console.log(`Error getting positions: ${error.message}`);
@@ -947,21 +994,11 @@ app.post('/api/getdata', limiter, async (req, res) => {
       const page = pages[0];
       
       // Set user agent and other optimizations
-      await Promise.all([
-        page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'),
-        page.setRequestInterception(true),
-        page.setDefaultNavigationTimeout(15000)
-      ]);
-      
-      // Block unnecessary resources
-      page.on('request', (req) => {
-        const resourceType = req.resourceType();
-        if (resourceType === 'image' || resourceType === 'media' || resourceType === 'font') {
-          req.abort();
-        } else {
-          req.continue();
-        }
-      });
+      // Configure page with basic settings
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setDefaultNavigationTimeout(15000);
+    
+    // Note: Disabling request interception as it might cause issues
       
       // Navigate to Trade Republic
       console.log("\n🌐 Opening Trade Republic portfolio...");
