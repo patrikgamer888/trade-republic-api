@@ -606,122 +606,15 @@ async function loginToTradeRepublic(page, credentials) {
   }
 }
 
-// Function to click dropdown
-async function clickSinceBuyEuroOption(page) {
-  try {
-    console.log("\n🔄 Setting view to 'Since buy (€)'...");
-    
-    // Find and click dropdown button
-    console.log("Looking for dropdown button...");
-    const dropdownButtonSelector = ".dropdownList__openButton";
-    try {
-      await page.click(dropdownButtonSelector);
-      console.log("✅ Clicked dropdown button");
-    } catch (clickError) {
-      console.log(`❌ Failed to click dropdown button: ${clickError.message}`);
-      return false;
-    }
-    
-    // Brief wait for dropdown to appear
-    await sleep(500);
-    
-    // Try multiple selection methods in sequence
-    const selectionMethods = [
-      // Direct click by ID
-      async () => {
-        logDebug("Trying to click by ID...");
-        await page.click("#investments-sinceBuyabs");
-        return true;
-      },
-      
-      // Try by paragraph class
-      async () => {
-        logDebug("Trying by paragraph class...");
-        const found = await page.evaluate(() => {
-          const paragraphs = document.querySelectorAll('p.dropdownList__optionName');
-          for (let i = 0; i < paragraphs.length; i++) {
-            const p = paragraphs[i];
-            if (p.textContent.includes('Since buy') && p.textContent.includes('€')) {
-              const li = p.closest('li');
-              if (li) {
-                li.click();
-                return true;
-              }
-            }
-          }
-          return false;
-        });
-        return found;
-      },
-      
-      // Try direct XPath
-      async () => {
-        logDebug("Trying XPath method...");
-        const [element] = await page.$x("//p[contains(text(), 'Since buy') and contains(text(), '€')]/ancestor::li");
-        if (element) {
-          await element.click();
-          return true;
-        }
-        return false;
-      }
-    ];
-    
-    // Try each method until one works
-    for (const method of selectionMethods) {
-      try {
-        if (await method()) {
-          console.log("✅ Selected 'Since buy (€)' option");
-          await sleep(500);
-          return true;
-        }
-      } catch (error) {
-        continue;
-      }
-    }
-    
-    console.log("❌ Could not find or click 'Since buy (€)' option");
-    return false;
-  } catch (error) {
-    console.log(`Error setting view: ${error.message}`);
-    return false;
-  }
-}
-
-// Get portfolio data
+// Get portfolio data - MODIFIED to not fetch EUR values
 async function getPortfolioData(page) {
   const data = {
-    portfolio_balance: "Not available",
     positions: [],
-    cash_balance: "Not available",
     timestamp: new Date().toISOString()
   };
   
   try {
-    console.log("\n📊 Fetching portfolio data...");
-    
-    // Get portfolio balance
-    try {
-      const balanceSelectors = [
-        ".currencyStatus span[role='status']", 
-        "[class*='portfolioValue']",
-        "[class*='portfolioBalance']"
-      ];
-      
-      for (const selector of balanceSelectors) {
-        const balanceElement = await page.$(selector);
-        if (balanceElement) {
-          data.portfolio_balance = await page.evaluate(el => el.textContent.trim(), balanceElement);
-          console.log(`💰 Portfolio balance: ${data.portfolio_balance}`);
-          break;
-        }
-      }
-    } catch (error) {
-      console.log(`Error getting portfolio balance: ${error.message}`);
-    }
-    
-    // Set view to show "Since buy (€)"
-    console.log("\nSetting view to show Euro values...");
-    await clickSinceBuyEuroOption(page);
+    console.log("\n📊 Fetching portfolio data (without EUR values)...");
     
     // Get all position data
     try {
@@ -730,7 +623,7 @@ async function getPortfolioData(page) {
       // Wait for portfolio list to become available
       await sleep(1500);
       
-      // Get all position data with multiple selector attempts
+      // Get all position data with multiple selector attempts (excluding EUR values)
       const positions = await page.evaluate(() => {
         const results = [];
         
@@ -777,14 +670,6 @@ async function getPortfolioData(page) {
             '[class*="instrumentTitle"]'
           ];
           
-          // Try multiple selectors for price
-          const priceSelectors = [
-            '.instrumentListItem__currentPrice',
-            '[class*="currentPrice"]',
-            '[class*="positionValue"]',
-            '[class*="instrumentValue"]'
-          ];
-          
           // Try multiple selectors for shares
           const sharesSelectors = [
             '.tag.instrumentListItem__sharesTag',
@@ -800,12 +685,6 @@ async function getPortfolioData(page) {
             if (nameElement) break;
           }
           
-          let priceElement = null;
-          for (const selector of priceSelectors) {
-            priceElement = item.querySelector(selector);
-            if (priceElement) break;
-          }
-          
           let sharesElement = null;
           for (const selector of sharesSelectors) {
             sharesElement = item.querySelector(selector);
@@ -814,16 +693,14 @@ async function getPortfolioData(page) {
           
           // Extract text values
           const name = nameElement ? nameElement.textContent.trim() : "Unknown";
-          const value = priceElement ? priceElement.textContent.trim() : "Unknown";
           const shares = sharesElement ? sharesElement.textContent.trim() : "Unknown";
           
           // Only add to results if we have meaningful data
-          if (name !== "Unknown" || value !== "Unknown") {
+          if (name !== "Unknown") {
             results.push({
               id,
               name,
-              shares,
-              total_value: value
+              shares
             });
           }
         }
@@ -854,8 +731,7 @@ async function getPortfolioData(page) {
               results.push({
                 id: `retry-${i}`,
                 name: name.substring(0, 30), // Take first 30 chars as name
-                shares: "Unknown",
-                total_value: "Unknown"
+                shares: "Unknown"
               });
             }
           }
@@ -871,46 +747,12 @@ async function getPortfolioData(page) {
         positions.forEach((pos, index) => {
           logDebug(`📊 Position ${index+1}: ${pos.name} (${pos.id})`);
           logDebug(`   Shares: ${pos.shares}`);
-          logDebug(`   Value: ${pos.total_value}`);
           data.positions.push(pos);
         });
       }
       
     } catch (error) {
       console.log(`Error getting positions: ${error.message}`);
-    }
-    
-    // Get cash balance by navigating to transactions page
-    try {
-      console.log("\n💵 Looking for cash balance...");
-      
-      // Navigate to transactions page
-      console.log("Navigating to transactions page...");
-      
-      // Find the transactions link
-      const transactionsLink = await page.$('a.navigationItem__link[href="/profile/transactions"]');
-      
-      if (transactionsLink) {
-        // Click the link
-        await transactionsLink.click();
-        console.log("Clicked transactions link");
-        
-        // Brief wait for page to load
-        await sleep(1000);
-        
-        // Find the cash balance element
-        const cashBalanceElement = await page.$('.cashBalance__amount');
-        if (cashBalanceElement) {
-          data.cash_balance = await page.evaluate(el => el.textContent.trim(), cashBalanceElement);
-          console.log(`💰 Cash balance: ${data.cash_balance}`);
-        } else {
-          console.log("Cash balance element not found on transactions page");
-        }
-      } else {
-        console.log("Could not find transactions link");
-      }
-    } catch (error) {
-      console.log(`Error getting cash balance: ${error.message}`);
     }
     
     return data;
@@ -936,8 +778,8 @@ app.get('/api/ping', (req, res) => {
 app.get('/api/status', (req, res) => {
   res.json({ 
     status: 'ok',
-    service: 'Trade Republic One-Time Data API',
-    version: '1.0.0',
+    service: 'Trade Republic One-Time Data API (No Values)',
+    version: '1.1.0',
     activeRequests,
     queuedRequests: requestQueue.length,
     pendingSessions: pendingSessions.size,
@@ -1159,7 +1001,7 @@ setTimeout(pingService, 5000);
 // Start the server
 app.listen(PORT, () => {
   console.log(`Trade Republic API server running on port ${PORT}`);
-  console.log(`One-time data retrieval mode with proper 2FA handling`);
+  console.log(`One-time data retrieval mode without EUR values`);
   console.log(`Self-ping EVERY ${PING_INTERVAL/60000} MINUTES to prevent spin-down`);
   console.log(`Max concurrent requests: ${MAX_CONCURRENT_REQUESTS}`);
 });
