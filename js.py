@@ -15,13 +15,40 @@ from werkzeug.serving import run_simple
 import io
 import zipfile
 import uuid
+import traceback
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG for more verbose output
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Set up a custom handler to capture logs from all modules including pytr
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+
+# Create a string IO stream handler to capture logs for debugging
+class CapturingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.logs = []
+    
+    def emit(self, record):
+        self.logs.append(self.format(record))
+    
+    def get_logs(self):
+        return '\n'.join(self.logs)
+    
+    def clear(self):
+        self.logs = []
+
+# Add the capturing handler to the root logger
+capturing_handler = CapturingHandler()
+capturing_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+capturing_handler.setFormatter(formatter)
+root_logger.addHandler(capturing_handler)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24).hex())
@@ -36,6 +63,78 @@ AUTH_SESSIONS = {}
 
 # Define timezone constants
 TZ_EUROPE_BERLIN = pytz.timezone('Europe/Berlin')
+
+# Custom version of login to capture logs and debug 2FA issues
+async def custom_login(phone, pin, verification_code=None):
+    """Custom login function to wrap pytr.account.login with better debugging"""
+    logger.info("=== CUSTOM LOGIN START ===")
+    logger.info(f"Phone: {phone}, PIN provided: {bool(pin)}, Code: {verification_code}")
+    
+    # Clear existing environment variables then set
+    os.environ.pop('TR_PHONE', None)
+    os.environ.pop('TR_PIN', None)
+    
+    # Set the environment variables
+    os.environ['TR_PHONE'] = phone
+    os.environ['TR_PIN'] = pin
+    logger.info(f"Set environment variables TR_PHONE={phone}")
+    
+    # Save original input function
+    original_input = __builtins__.input
+    
+    # Track if 2FA prompt was received
+    prompt_received = [False]
+    
+    def custom_input(prompt):
+        """Custom input function to capture 2FA prompts"""
+        logger.info(f">>> INPUT PROMPT: '{prompt}'")
+        prompt_received[0] = True
+        
+        if verification_code:
+            logger.info(f">>> RETURNING VERIFICATION CODE: {verification_code}")
+            return verification_code
+        else:
+            # If we don't have a verification code, we're in initial login mode
+            # Just return an empty string to continue (will likely fail auth)
+            logger.info(">>> No verification code provided, returning empty string")
+            return ""
+    
+    # Monkey patch input
+    __builtins__.input = custom_input
+    
+    # Capture stdout temporarily
+    original_stdout = sys.stdout
+    stdout_capture = io.StringIO()
+    sys.stdout = stdout_capture
+    
+    try:
+        logger.info("Calling pytr.account.login()")
+        tr_client = login()
+        logger.info("pytr.account.login() completed")
+        return {
+            "success": True,
+            "client": tr_client,
+            "prompt_received": prompt_received[0],
+            "stdout": stdout_capture.getvalue(),
+            "logs": capturing_handler.get_logs()
+        }
+    except Exception as e:
+        logger.error(f"Error in login: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc(),
+            "prompt_received": prompt_received[0],
+            "stdout": stdout_capture.getvalue(),
+            "logs": capturing_handler.get_logs()
+        }
+    finally:
+        # Restore original input and stdout
+        __builtins__.input = original_input
+        sys.stdout = original_stdout
+        logger.info("=== CUSTOM LOGIN END ===")
 
 class QuickDL(DL):
     def dl_doc(self, *_, **__):               # skip PDFs
@@ -513,10 +612,14 @@ async def fetch_data(client=None, sessionId=None):
     try:
         tr = client
         if not tr and sessionId and sessionId in AUTH_SESSIONS:
+            logger.info(f"Using client from session: {sessionId}")
             tr = AUTH_SESSIONS[sessionId]["client"]
         
         if not tr:
+            logger.error("No authenticated client available")
             return {"error": "No authenticated client available"}
+        
+        logger.info("Authenticated client found, starting data fetch")
         
         results = {
             "status": "success",
@@ -525,11 +628,13 @@ async def fetch_data(client=None, sessionId=None):
         
         # 1) transactions -------------------------------------------------
         try:
+            logger.info("Starting transactions download")
             await QuickDL(
                 tr, OUT, "{iso_date}", since_timestamp=0,
                 format_export="csv", sort_export=True
             ).dl_loop()
         except SystemExit:
+            logger.info("QuickDL SystemExit caught (expected)")
             acc = OUT / "account_transactions.csv"
             tx = OUT / "transactions.csv"
             if acc.exists():
@@ -537,6 +642,7 @@ async def fetch_data(client=None, sessionId=None):
                     tx.unlink()
                 acc.rename(tx)
                 results["files"].append("transactions.csv")
+                logger.info("Renamed account_transactions.csv to transactions.csv")
                 
             for junk in ("other_events.json",
                         "events_with_documents.json",
@@ -544,24 +650,30 @@ async def fetch_data(client=None, sessionId=None):
                 f = OUT / junk
                 if f.exists():
                     f.unlink()
+                    logger.info(f"Removed junk file: {junk}")
             
             # Fix timezone issue in transactions file
             if tx.exists():
+                logger.info("Fixing transaction dates")
                 if not fix_trade_republic_csv(tx):
                     if not fix_transaction_dates_direct(tx):
                         fix_transaction_dates(tx)
 
         # 2) portfolio ----------------------------------------------------
+        logger.info("Starting portfolio download")
         port = Portfolio(tr)
         await port.portfolio_loop()
         port_csv = OUT / "portfolio.csv"
         port.portfolio_to_csv(port_csv)
         results["files"].append("portfolio.csv")
+        logger.info("Portfolio data saved to CSV")
         
         # 3) cash ---------------------------------------------------------
+        logger.info("Fetching cash data")
         cash = await tr._receive_one(tr.cash(), timeout=5)
         (OUT / "cash.json").write_text(json.dumps(cash, indent=2))
         results["files"].append("cash.json")
+        logger.info("Cash data saved to JSON")
 
         # 4) details per ISIN ---------------------------------------------
         if port_csv.exists():
@@ -574,6 +686,8 @@ async def fetch_data(client=None, sessionId=None):
                     isin = row.get('ISIN')
                     if isin and isin.strip():
                         isins.add(isin)
+            
+            logger.info(f"Found {len(isins)} unique ISINs in portfolio")
             
             # Dictionary to track derivative ISINs
             derivative_isins = set()
@@ -604,11 +718,13 @@ async def fetch_data(client=None, sessionId=None):
                     results["files"].append(f"details_{current_isin}.csv")
             
             # Process the portfolio CSV to remove unwanted columns and derivative positions
+            logger.info("Processing portfolio CSV to remove unwanted columns and derivatives")
             process_portfolio_csv(port_csv, derivative_isins)
         else:
             logger.error(f"Portfolio file not found: {port_csv}")
             results["portfolio_status"] = "not_found"
-            
+        
+        logger.info(f"Data fetch completed successfully, returning {len(results['files'])} files")
         return results
         
     except Exception as e:
@@ -622,94 +738,194 @@ def health_check():
     return jsonify({"status": "ok"})
 
 @app.route('/start-auth', methods=['POST'])
-def start_auth():
+async def start_auth():
     """Start the authentication process with phone and PIN"""
+    logger.info("=== START AUTH ENDPOINT CALLED ===")
+    capturing_handler.clear()  # Clear previous logs
+    
     data = request.json or {}
     phone = data.get('phone')
     pin = data.get('pin')
     
+    logger.info(f"Received auth request for phone: {phone}")
+    
     if not phone or not pin:
+        logger.error("Phone or PIN missing in request")
         return jsonify({"error": "Phone and PIN are required"}), 400
     
     try:
-        # Set environment variables for pytr login
-        os.environ['TR_PHONE'] = phone
-        os.environ['TR_PIN'] = pin
-        
         # Generate a session ID
         session_id = str(uuid.uuid4())
+        logger.info(f"Generated session ID: {session_id}")
         
-        # Store this session for later use
+        # Store initial session info
         AUTH_SESSIONS[session_id] = {
-            "status": "awaiting_2fa",
+            "status": "initializing",
             "phone": phone,
+            "pin": pin,
             "initiated": datetime.now()
         }
         
-        # This response tells the client to prompt for 2FA code
-        return jsonify({
-            "status": "awaiting_2fa",
-            "sessionId": session_id,
-            "message": "Please provide 2FA code"
-        })
+        # Try initial login step to see if 2FA is requested
+        logger.info("Attempting initial login step")
+        login_result = await custom_login(phone, pin)
+        
+        # Store login output in session for debugging
+        AUTH_SESSIONS[session_id]["login_attempt_1"] = {
+            "success": login_result["success"],
+            "prompt_received": login_result["prompt_received"],
+            "stdout": login_result["stdout"],
+            "logs": login_result["logs"]
+        }
+        
+        # Check if login was immediate or requires 2FA
+        if login_result["success"]:
+            # Success on first try (probably no 2FA required)
+            logger.info("Login succeeded immediately (no 2FA required)")
+            AUTH_SESSIONS[session_id]["status"] = "authenticated"
+            AUTH_SESSIONS[session_id]["client"] = login_result["client"]
+            AUTH_SESSIONS[session_id]["authenticated_at"] = datetime.now()
+            
+            return jsonify({
+                "status": "authenticated",
+                "sessionId": session_id,
+                "message": "Authentication successful",
+                "debug_info": {
+                    "prompt_received": login_result["prompt_received"],
+                    "stdout": login_result["stdout"]
+                }
+            })
+        else:
+            # Check if we received a 2FA prompt
+            if login_result["prompt_received"]:
+                logger.info("2FA prompt detected, updating session status")
+                AUTH_SESSIONS[session_id]["status"] = "awaiting_2fa"
+                
+                # Return awaiting_2fa response for client to prompt user
+                return jsonify({
+                    "status": "awaiting_2fa",
+                    "sessionId": session_id,
+                    "message": "Please provide 2FA code",
+                    "debug_info": {
+                        "prompt_received": login_result["prompt_received"],
+                        "stdout": login_result["stdout"]
+                    }
+                })
+            else:
+                # Login failed but no 2FA prompt received
+                logger.error("Login failed without 2FA prompt")
+                AUTH_SESSIONS[session_id]["status"] = "failed"
+                AUTH_SESSIONS[session_id]["error"] = login_result.get("error", "Unknown error")
+                
+                return jsonify({
+                    "error": "Authentication failed",
+                    "details": "Login failed without 2FA prompt",
+                    "debug_info": {
+                        "error": login_result.get("error"),
+                        "error_type": login_result.get("error_type"),
+                        "stdout": login_result["stdout"],
+                        "logs": login_result["logs"]
+                    }
+                }), 500
     except Exception as e:
         logger.error(f"Error starting authentication: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "logs": capturing_handler.get_logs()
+        }), 500
 
 @app.route('/verify-2fa', methods=['POST'])
 async def verify_2fa():
     """Verify 2FA code and complete authentication"""
+    logger.info("=== VERIFY 2FA ENDPOINT CALLED ===")
+    capturing_handler.clear()  # Clear previous logs
+    
     data = request.json or {}
     session_id = data.get('sessionId')
     code = data.get('code')
     
+    logger.info(f"Received 2FA verification request for session: {session_id}, code: {code}")
+    
     if not session_id or not code:
+        logger.error("Session ID or 2FA code missing")
         return jsonify({"error": "Session ID and 2FA code are required"}), 400
     
     if session_id not in AUTH_SESSIONS:
+        logger.error(f"Invalid session ID: {session_id}")
         return jsonify({"error": "Invalid or expired session"}), 401
     
     session_data = AUTH_SESSIONS[session_id]
+    logger.info(f"Found session with status: {session_data.get('status')}")
+    
+    if session_data.get('status') != "awaiting_2fa":
+        logger.error(f"Session not awaiting 2FA: {session_data.get('status')}")
+        return jsonify({"error": f"Session in wrong state: {session_data.get('status')}"}), 400
     
     try:
-        # At this point, the client has provided the 2FA code 
-        # which is entered in the terminal by the user in response
-        # to the prompt from pytr.account.login()
+        # Get the phone and PIN from the session
+        phone = session_data.get('phone')
+        pin = session_data.get('pin')
         
-        # Provide a mechanism for the login to receive the 2FA code
-        def custom_input(prompt):
-            # This function is monkey-patched to provide the 2FA code
-            # instead of waiting for terminal input
-            logger.info(f"Intercepted prompt: {prompt}")
-            return code
+        if not phone or not pin:
+            logger.error("Phone or PIN missing in session data")
+            return jsonify({"error": "Session missing credentials"}), 500
         
-        # Monkey patch the input function temporarily
-        original_input = __builtins__.input
-        __builtins__.input = custom_input
+        # Try the login with the verification code
+        logger.info(f"Attempting login with 2FA code: {code}")
+        login_result = await custom_login(phone, pin, code)
         
-        try:
-            # Perform the login with the provided credentials
-            tr_client = login()
-            
-            # Store the authenticated client
-            session_data["client"] = tr_client
+        # Store login output in session for debugging
+        session_data["login_attempt_2"] = {
+            "success": login_result["success"],
+            "prompt_received": login_result["prompt_received"],
+            "stdout": login_result["stdout"],
+            "logs": login_result["logs"]
+        }
+        
+        if login_result["success"]:
+            # Success with 2FA
+            logger.info("Login with 2FA succeeded")
             session_data["status"] = "authenticated"
+            session_data["client"] = login_result["client"]
             session_data["authenticated_at"] = datetime.now()
             
             return jsonify({
                 "status": "authenticated",
                 "sessionId": session_id,
-                "message": "Authentication successful"
+                "message": "Authentication successful",
+                "debug_info": {
+                    "stdout": login_result["stdout"]
+                }
             })
-        finally:
-            # Restore the original input function
-            __builtins__.input = original_input
+        else:
+            # Login failed even with 2FA code
+            logger.error("Login failed with 2FA code")
+            session_data["status"] = "failed"
+            session_data["error"] = login_result.get("error", "Unknown error")
+            
+            return jsonify({
+                "error": "Authentication failed",
+                "details": "Login failed with 2FA code",
+                "debug_info": {
+                    "error": login_result.get("error"),
+                    "error_type": login_result.get("error_type"),
+                    "stdout": login_result["stdout"],
+                    "logs": login_result["logs"]
+                }
+            }), 500
             
     except Exception as e:
         logger.error(f"Error during 2FA verification: {str(e)}")
+        logger.error(traceback.format_exc())
         session_data["status"] = "failed"
         session_data["error"] = str(e)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "logs": capturing_handler.get_logs()
+        }), 500
 
 @app.route('/fetch-data', methods=['POST'])
 async def handle_fetch_data():
@@ -718,19 +934,27 @@ async def handle_fetch_data():
     auth_header = request.headers.get('Authorization', '')
     session_id = None
     
+    logger.info(f"Received fetch-data request with auth header: {auth_header}")
+    
     if auth_header.startswith('Bearer '):
         session_id = auth_header[7:]  # Remove 'Bearer ' prefix
+        logger.info(f"Extracted session ID: {session_id}")
     
     if not session_id or session_id not in AUTH_SESSIONS:
+        logger.error(f"Invalid session ID: {session_id}")
         return jsonify({"error": "Unauthorized - valid session required"}), 401
     
     session_data = AUTH_SESSIONS[session_id]
+    logger.info(f"Found session data: {session_data}")
     
     if session_data["status"] != "authenticated" or "client" not in session_data:
+        logger.error(f"Session not authenticated: {session_data['status']}")
         return jsonify({"error": "Session not authenticated"}), 401
     
     # Now that we have an authenticated client, fetch the data
+    logger.info(f"Calling fetch_data with session ID: {session_id}")
     result = await fetch_data(sessionId=session_id)
+    logger.info(f"fetch_data completed with result: {result}")
     return jsonify(result)
 
 @app.route('/files', methods=['GET'])
@@ -830,6 +1054,30 @@ def start_session_cleanup():
     cleanup_thread.daemon = True
     cleanup_thread.start()
     logger.info("Session cleanup thread started")
+
+# Add an endpoint to check status and get debug info
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Return debug info for troubleshooting"""
+    # This endpoint returns current debug info from the server
+    response = {
+        "sessions": {},
+        "logs": capturing_handler.get_logs(),
+        "environment": {
+            "TR_PHONE_SET": bool(os.environ.get('TR_PHONE')),
+            "TR_PIN_SET": bool(os.environ.get('TR_PIN')),
+        }
+    }
+    
+    # Add sanitized session data (removing credentials and client objects)
+    for session_id, session_data in AUTH_SESSIONS.items():
+        sanitized_data = {k: v for k, v in session_data.items() if k not in ['client', 'pin']}
+        if 'phone' in sanitized_data:
+            # Mask phone
+            sanitized_data['phone'] = sanitized_data['phone'][:3] + '****'
+        response["sessions"][session_id] = sanitized_data
+    
+    return jsonify(response)
 
 # Main entrypoint for Flask app
 if __name__ == "__main__":
