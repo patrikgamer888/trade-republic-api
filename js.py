@@ -8,12 +8,13 @@ from datetime import datetime, timedelta
 import pytz
 import threading
 import time
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, session
 import requests
 import logging
 from werkzeug.serving import run_simple
 import io
 import zipfile
+import uuid
 
 # Configure logging
 logging.basicConfig(
@@ -23,15 +24,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24).hex())
 
 # Configure output directory
 OUT = Path("pytr_out")
 OUT.mkdir(exist_ok=True)
 
-# Global variables to store auth token and credentials
-AUTH_TOKEN = None
-TR_PHONE = os.environ.get('TR_PHONE', '')
-TR_PIN = os.environ.get('TR_PIN', '')
+# Global variables to store auth sessions
+# This is a simple in-memory storage. For production, use Redis or a database
+AUTH_SESSIONS = {}
 
 # Define timezone constants
 TZ_EUROPE_BERLIN = pytz.timezone('Europe/Berlin')
@@ -504,29 +505,18 @@ def process_portfolio_csv(csv_file, derivative_isins=None):
     logger.info(f"Processed portfolio CSV: removed {len(indices_to_remove)} columns and {len(rows) - len(filtered_rows)} derivative positions")
     return True
 
-async def fetch_data(phone=None, pin=None):
+async def fetch_data(client=None, sessionId=None):
     """
     Main function to fetch data from Trade Republic.
     Returns a summary of the operation.
     """
-    global AUTH_TOKEN
-    
     try:
-        # Use the provided credentials or global variables
-        if phone and pin:
-            os.environ['TR_PHONE'] = phone
-            os.environ['TR_PIN'] = pin
-            logger.info("Using provided credentials")
-        elif TR_PHONE and TR_PIN:
-            logger.info("Using environment credentials")
-        else:
-            return {"error": "No credentials provided"}
+        tr = client
+        if not tr and sessionId and sessionId in AUTH_SESSIONS:
+            tr = AUTH_SESSIONS[sessionId]["client"]
         
-        # 2-FA prompt
-        tr = login()
-        
-        # Store authentication token for future use
-        AUTH_TOKEN = tr
+        if not tr:
+            return {"error": "No authenticated client available"}
         
         results = {
             "status": "success",
@@ -549,8 +539,8 @@ async def fetch_data(phone=None, pin=None):
                 results["files"].append("transactions.csv")
                 
             for junk in ("other_events.json",
-                         "events_with_documents.json",
-                         "all_events.json"):    
+                        "events_with_documents.json",
+                        "all_events.json"):    
                 f = OUT / junk
                 if f.exists():
                     f.unlink()
@@ -631,20 +621,117 @@ def health_check():
     """Health check endpoint for Render keep-alive"""
     return jsonify({"status": "ok"})
 
-@app.route('/trigger', methods=['POST'])
-async def trigger_fetch():
-    """Trigger the data fetching process"""
+@app.route('/start-auth', methods=['POST'])
+def start_auth():
+    """Start the authentication process with phone and PIN"""
     data = request.json or {}
     phone = data.get('phone')
     pin = data.get('pin')
     
-    # Run the fetch_data function asynchronously
+    if not phone or not pin:
+        return jsonify({"error": "Phone and PIN are required"}), 400
+    
     try:
-        result = await fetch_data(phone, pin)
-        return jsonify(result)
+        # Set environment variables for pytr login
+        os.environ['TR_PHONE'] = phone
+        os.environ['TR_PIN'] = pin
+        
+        # Generate a session ID
+        session_id = str(uuid.uuid4())
+        
+        # Store this session for later use
+        AUTH_SESSIONS[session_id] = {
+            "status": "awaiting_2fa",
+            "phone": phone,
+            "initiated": datetime.now()
+        }
+        
+        # This response tells the client to prompt for 2FA code
+        return jsonify({
+            "status": "awaiting_2fa",
+            "sessionId": session_id,
+            "message": "Please provide 2FA code"
+        })
     except Exception as e:
-        logger.error(f"Error in trigger_fetch: {str(e)}")
+        logger.error(f"Error starting authentication: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+@app.route('/verify-2fa', methods=['POST'])
+async def verify_2fa():
+    """Verify 2FA code and complete authentication"""
+    data = request.json or {}
+    session_id = data.get('sessionId')
+    code = data.get('code')
+    
+    if not session_id or not code:
+        return jsonify({"error": "Session ID and 2FA code are required"}), 400
+    
+    if session_id not in AUTH_SESSIONS:
+        return jsonify({"error": "Invalid or expired session"}), 401
+    
+    session_data = AUTH_SESSIONS[session_id]
+    
+    try:
+        # At this point, the client has provided the 2FA code 
+        # which is entered in the terminal by the user in response
+        # to the prompt from pytr.account.login()
+        
+        # Provide a mechanism for the login to receive the 2FA code
+        def custom_input(prompt):
+            # This function is monkey-patched to provide the 2FA code
+            # instead of waiting for terminal input
+            logger.info(f"Intercepted prompt: {prompt}")
+            return code
+        
+        # Monkey patch the input function temporarily
+        original_input = __builtins__.input
+        __builtins__.input = custom_input
+        
+        try:
+            # Perform the login with the provided credentials
+            tr_client = login()
+            
+            # Store the authenticated client
+            session_data["client"] = tr_client
+            session_data["status"] = "authenticated"
+            session_data["authenticated_at"] = datetime.now()
+            
+            return jsonify({
+                "status": "authenticated",
+                "sessionId": session_id,
+                "message": "Authentication successful"
+            })
+        finally:
+            # Restore the original input function
+            __builtins__.input = original_input
+            
+    except Exception as e:
+        logger.error(f"Error during 2FA verification: {str(e)}")
+        session_data["status"] = "failed"
+        session_data["error"] = str(e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/fetch-data', methods=['POST'])
+async def handle_fetch_data():
+    """Fetch data after authentication"""
+    # Extract the session ID from Authorization header
+    auth_header = request.headers.get('Authorization', '')
+    session_id = None
+    
+    if auth_header.startswith('Bearer '):
+        session_id = auth_header[7:]  # Remove 'Bearer ' prefix
+    
+    if not session_id or session_id not in AUTH_SESSIONS:
+        return jsonify({"error": "Unauthorized - valid session required"}), 401
+    
+    session_data = AUTH_SESSIONS[session_id]
+    
+    if session_data["status"] != "authenticated" or "client" not in session_data:
+        return jsonify({"error": "Session not authenticated"}), 401
+    
+    # Now that we have an authenticated client, fetch the data
+    result = await fetch_data(sessionId=session_id)
+    return jsonify(result)
 
 @app.route('/files', methods=['GET'])
 def list_files():
@@ -712,10 +799,45 @@ def start_keep_alive():
     keep_alive_thread.start()
     logger.info("Keep-alive thread started")
 
+def cleanup_sessions():
+    """Clean up expired sessions periodically"""
+    while True:
+        try:
+            # Sleep for 1 hour
+            time.sleep(3600)
+            
+            # Get current time
+            now = datetime.now()
+            
+            # Find expired sessions (older than 24 hours)
+            expired_sessions = []
+            for session_id, data in AUTH_SESSIONS.items():
+                initiated = data.get("initiated")
+                if initiated and (now - initiated).total_seconds() > 86400:  # 24 hours
+                    expired_sessions.append(session_id)
+            
+            # Remove expired sessions
+            for session_id in expired_sessions:
+                del AUTH_SESSIONS[session_id]
+                
+            logger.info(f"Cleaned up {len(expired_sessions)} expired sessions")
+        except Exception as e:
+            logger.error(f"Error in session cleanup: {str(e)}")
+
+def start_session_cleanup():
+    """Start the session cleanup thread"""
+    cleanup_thread = threading.Thread(target=cleanup_sessions)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+    logger.info("Session cleanup thread started")
+
 # Main entrypoint for Flask app
 if __name__ == "__main__":
     # Start the keep-alive thread
     start_keep_alive()
+    
+    # Start the session cleanup thread
+    start_session_cleanup()
     
     # Get port from environment or use default
     port = int(os.environ.get('PORT', 8000))
